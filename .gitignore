@@ -2,3 +2,4 @@ node_modules/
 *.vsix
 out/
 dist/extension.js.map
+.DS_Store
