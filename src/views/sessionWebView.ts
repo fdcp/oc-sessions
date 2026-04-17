@@ -28,13 +28,28 @@ export class SessionPanelProvider implements vscode.WebviewViewProvider {
     if (!this.view) {
       return;
     }
+    const dbPath = (this.dataProvider as unknown as { dbPath?: string }).dbPath || "unknown";
     try {
       this.dataProvider.init();
-    } catch {
-      this.view.webview.html = this.wrapHtml("<p>Database not found.</p>");
+    } catch (e: unknown) {
+      const msg = e instanceof Error ? e.message : String(e);
+      const stack = e instanceof Error ? e.stack ?? "" : "";
+      this.view.webview.html = this.wrapHtml(
+        `<p style="color:red;">Database init error: ${msg}</p><p>DB path: ${dbPath}</p><pre style="font-size:10px;overflow:auto;">${stack}</pre>`
+      );
       return;
     }
-    const projects = this.dataProvider.getProjects();
+    let projects: ReturnType<DataProvider["getProjects"]>;
+    try {
+      projects = this.dataProvider.getProjects();
+    } catch (e: unknown) {
+      const msg = e instanceof Error ? e.message : String(e);
+      const stack = e instanceof Error ? e.stack ?? "" : "";
+      this.view.webview.html = this.wrapHtml(
+        `<p style="color:red;">Error loading projects: ${msg}</p><p>DB path: ${dbPath}</p><pre style="font-size:10px;overflow:auto;">${stack}</pre>`
+      );
+      return;
+    }
     this.view.webview.html = this.buildMainHtml(projects);
   }
 

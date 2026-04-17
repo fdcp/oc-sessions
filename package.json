@@ -2,7 +2,7 @@
   "name": "oc-sessions",
   "displayName": "OpenCode Sessions",
   "description": "Browse, search, and export OpenCode session history. View full conversation content including user messages, AI reasoning, tool calls, and file diffs.",
-  "version": "0.7.1",
+  "version": "0.7.2",
   "publisher": "zhaoxiuwei",
   "license": "MIT",
   "engines": {
