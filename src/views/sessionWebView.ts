@@ -472,6 +472,7 @@ export class SessionPanelProvider implements vscode.WebviewViewProvider {
         <span class="chip" data-type="reasoning" onclick="setPartFilter('reasoning')">Reasoning</span>
         <span class="chip" data-type="tool" onclick="setPartFilter('tool')">Tools</span>
         <span class="chip" data-type="patch" onclick="setPartFilter('patch')">Patches</span>
+        <span class="chip chip-count" id="partFilterCount" style="margin-left:auto;cursor:default;background:none;opacity:0.4;"></span>
       </div>
       <div class="toolbar-row">
         <button class="btn-sm" onclick="selectAllMessages()">Select All</button>
@@ -797,6 +798,15 @@ function setPartFilter(type) {
   document.querySelectorAll(".chip").forEach(c => {
     c.classList.toggle("active", c.dataset.type === type);
   });
+  const countEl = document.getElementById("partFilterCount");
+  if (countEl) {
+    if (type !== "all") {
+      const total = Object.values(partsCache).reduce((sum, parts) => sum + parts.filter(p => p.type === type).length, 0);
+      countEl.textContent = total + " parts";
+    } else {
+      countEl.textContent = "";
+    }
+  }
   refreshContentViewer();
 }
 
