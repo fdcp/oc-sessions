@@ -10,7 +10,6 @@ Browse, search, and export [OpenCode](https://opencode.ai) session history direc
 - **Full Conversation Content** — View user messages, AI reasoning, tool calls/results, patches
 - **Directory Browser** — Select from all directories where OpenCode has been used
 - **Session List** — Paginated session list with turn count and timestamps
-- **Message List** — Checkboxes for batch selection
 - **Content Viewer** — Click any message to see its full content
 - **Display Options** — Toggle visibility of text, reasoning, tools, patches, metadata
 - **Export to Markdown** — Export selected messages as Markdown
@@ -55,7 +54,7 @@ https://marketplace.visualstudio.com/items?itemName=zhaoxiuwei.oc-sessions
 ### From VSIX
 
 ```bash
-code --install-extension oc-sessions-0.6.0.vsix
+code --install-extension oc-sessions-0.8.0.vsix
 ```
 
 Get the latest VSIX from the [Releases](https://github.com/fdcp/oc-sessions/releases) page.

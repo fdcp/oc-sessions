@@ -63,13 +63,13 @@ export interface SessionDiff {
 }
 
 export interface TodoInfo {
-  id: string;
   sessionId: string;
-  timeCreated: number;
-  title: string;
   content: string;
   status: string;
   priority: string;
+  position: number;
+  timeCreated: number;
+  timeUpdated: number;
 }
 
 export interface GetSessionsOpts {
@@ -88,7 +88,7 @@ export class DataProvider {
     this.storagePath = path.join(path.dirname(dbPath), "storage", "session_diff");
   }
 
-  async init(): Promise<void> {
+  init(): void {
     if (!fs.existsSync(this.dbPath)) {
       throw new Error(`Database not found: ${this.dbPath}`);
     }
@@ -168,16 +168,15 @@ export class DataProvider {
     }
 
     const where = conditions.join(" AND ");
-
-    const countRows = this.querySync(`SELECT COUNT(*) as cnt FROM session s WHERE ${where}`, params);
-    const total = (countRows[0]?.cnt as number) || 0;
-
     let orderBy = "s.time_updated DESC";
     if (opts.sortBy === "created") {
       orderBy = "s.time_created DESC";
     } else if (opts.sortBy === "turns") {
       orderBy = "turn_count DESC";
     }
+
+    const countRows = this.querySync(`SELECT COUNT(*) as cnt FROM session s WHERE ${where}`, params);
+    const total = (countRows[0]?.cnt as number) || 0;
 
     const rows = this.querySync(
       `SELECT s.id, s.project_id, s.directory, s.title, s.time_created, s.time_updated,
@@ -262,23 +261,19 @@ export class DataProvider {
   }
 
   getTodosForSession(sessionId: string): TodoInfo[] {
-    let rows: Record<string, unknown>[] = [];
-    try {
-      rows = this.querySync(
-        `SELECT session_id, content, status, priority, position, time_created FROM todo WHERE session_id = ? ORDER BY position ASC`,
-        [sessionId]
-      );
-    } catch {
-      return [];
-    }
+    const rows = this.querySync(
+      `SELECT session_id, content, status, priority, position, time_created, time_updated
+       FROM todo WHERE session_id = ? ORDER BY position ASC`,
+      [sessionId]
+    );
     return rows.map((row) => ({
-      id: `${row.session_id as string}_${row.position as number}`,
       sessionId: row.session_id as string,
+      content: row.content as string,
+      status: (row.status as string) || "",
+      priority: (row.priority as string) || "",
+      position: (row.position as number) || 0,
       timeCreated: row.time_created as number,
-      title: (row.content as string) || "",
-      content: (row.content as string) || "",
-      status: (row.status as string) || "pending",
-      priority: (row.priority as string) || "medium",
+      timeUpdated: row.time_updated as number,
     }));
   }
 
@@ -286,76 +281,10 @@ export class DataProvider {
     this.execSync("UPDATE session SET title = ? WHERE id = ?", [newTitle, sessionId]);
   }
 
-  deleteSession(sessionId: string): void {
-    const script = [
-      "import sqlite3, sys",
-      "conn = sqlite3.connect(sys.argv[1])",
-      "cur = conn.cursor()",
-      "cur.execute('DELETE FROM part WHERE session_id = ?', (sys.argv[2],))",
-      "cur.execute('DELETE FROM message WHERE session_id = ?', (sys.argv[2],))",
-      "cur.execute('DELETE FROM todo WHERE session_id = ?', (sys.argv[2],))",
-      "cur.execute('DELETE FROM session WHERE id = ?', (sys.argv[2],))",
-      "conn.commit()",
-      "conn.close()",
-    ].join("\n");
-
-    execFileSync("python3", ["-c", script, this.dbPath, sessionId], { timeout: 15000 });
-
-    const diffFile = path.join(this.storagePath, `${sessionId}.json`);
-    if (fs.existsSync(diffFile)) {
-      fs.unlinkSync(diffFile);
-    }
-  }
-
-  deleteSessionsBatch(sessionIds: string[]): void {
+  deleteSessions(sessionIds: string[]): void {
     for (const sid of sessionIds) {
       this.deleteSession(sid);
     }
-  }
-
-  deleteMessage(messageId: string, sessionId: string): void {
-    const script = [
-      "import sqlite3, sys",
-      "conn = sqlite3.connect(sys.argv[1])",
-      "cur = conn.cursor()",
-      "cur.execute('DELETE FROM part WHERE message_id = ? AND session_id = ?', (sys.argv[2], sys.argv[3]))",
-      "cur.execute('DELETE FROM message WHERE id = ? AND session_id = ?', (sys.argv[2], sys.argv[3]))",
-      "conn.commit()",
-      "conn.close()",
-    ].join("\n");
-
-    execFileSync("python3", ["-c", script, this.dbPath, messageId, sessionId], { timeout: 10000 });
-  }
-
-  getSessionDiffs(sessionId: string): SessionDiff[] {
-    const diffFile = path.join(this.storagePath, `${sessionId}.json`);
-    if (!fs.existsSync(diffFile)) {
-      return [];
-    }
-    try {
-      const content = fs.readFileSync(diffFile, "utf-8");
-      const diffs = JSON.parse(content);
-      return Array.isArray(diffs) ? (diffs as SessionDiff[]) : [];
-    } catch {
-      return [];
-    }
-  }
-
-  getSessionStats(): { totalProjects: number; totalSessions: number; totalMessages: number; totalParts: number } {
-    const rows = this.querySync(
-      `SELECT
-        (SELECT COUNT(*) FROM project) as total_projects,
-        (SELECT COUNT(*) FROM session) as total_sessions,
-        (SELECT COUNT(*) FROM message) as total_messages,
-        (SELECT COUNT(*) FROM part) as total_parts`
-    );
-    const r = rows[0] || {};
-    return {
-      totalProjects: (r.total_projects as number) || 0,
-      totalSessions: (r.total_sessions as number) || 0,
-      totalMessages: (r.total_messages as number) || 0,
-      totalParts: (r.total_parts as number) || 0,
-    };
   }
 
   private parseMessage(row: Record<string, unknown>): MessageInfo {
@@ -436,6 +365,72 @@ export class DataProvider {
       finishReason,
       finishTokens,
       finishCost,
+    };
+  }
+
+  getSessionDiffs(sessionId: string): SessionDiff[] {
+    const diffFile = path.join(this.storagePath, `${sessionId}.json`);
+    if (!fs.existsSync(diffFile)) {
+      return [];
+    }
+    try {
+      const content = fs.readFileSync(diffFile, "utf-8");
+      const diffs = JSON.parse(content);
+      return Array.isArray(diffs) ? (diffs as SessionDiff[]) : [];
+    } catch {
+      return [];
+    }
+  }
+
+  deleteSession(sessionId: string): void {
+    const script = [
+      "import sqlite3, sys",
+      "conn = sqlite3.connect(sys.argv[1])",
+      "cur = conn.cursor()",
+      "cur.execute('DELETE FROM part WHERE session_id = ?', (sys.argv[2],))",
+      "cur.execute('DELETE FROM message WHERE session_id = ?', (sys.argv[2],))",
+      "cur.execute('DELETE FROM todo WHERE session_id = ?', (sys.argv[2],))",
+      "cur.execute('DELETE FROM session WHERE id = ?', (sys.argv[2],))",
+      "conn.commit()",
+      "conn.close()",
+    ].join("\n");
+
+    execFileSync("python3", ["-c", script, this.dbPath, sessionId], { timeout: 15000 });
+
+    const diffFile = path.join(this.storagePath, `${sessionId}.json`);
+    if (fs.existsSync(diffFile)) {
+      fs.unlinkSync(diffFile);
+    }
+  }
+
+  deleteMessage(messageId: string, sessionId: string): void {
+    const script = [
+      "import sqlite3, sys",
+      "conn = sqlite3.connect(sys.argv[1])",
+      "cur = conn.cursor()",
+      "cur.execute('DELETE FROM part WHERE message_id = ? AND session_id = ?', (sys.argv[2], sys.argv[3]))",
+      "cur.execute('DELETE FROM message WHERE id = ? AND session_id = ?', (sys.argv[2], sys.argv[3]))",
+      "conn.commit()",
+      "conn.close()",
+    ].join("\n");
+
+    execFileSync("python3", ["-c", script, this.dbPath, messageId, sessionId], { timeout: 10000 });
+  }
+
+  getSessionStats(): { totalProjects: number; totalSessions: number; totalMessages: number; totalParts: number } {
+    const rows = this.querySync(
+      `SELECT
+        (SELECT COUNT(*) FROM project) as total_projects,
+        (SELECT COUNT(*) FROM session) as total_sessions,
+        (SELECT COUNT(*) FROM message) as total_messages,
+        (SELECT COUNT(*) FROM part) as total_parts`
+    );
+    const r = rows[0] || {};
+    return {
+      totalProjects: (r.total_projects as number) || 0,
+      totalSessions: (r.total_sessions as number) || 0,
+      totalMessages: (r.total_messages as number) || 0,
+      totalParts: (r.total_parts as number) || 0,
     };
   }
 
