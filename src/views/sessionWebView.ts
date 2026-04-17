@@ -78,7 +78,12 @@ export class SessionPanelProvider implements vscode.WebviewViewProvider {
         const sessionId = msg.sessionId as string;
         const offset = msg.offset as number;
         const limit = msg.limit as number;
-        const result = this.dataProvider.getMessages(sessionId, offset, limit);
+        const msgFromDate = (msg.fromDate as number) || undefined;
+        const msgToDate = (msg.toDate as number) || undefined;
+        const result = this.dataProvider.getMessages(sessionId, offset, limit, {
+          fromDate: msgFromDate,
+          toDate: msgToDate,
+        });
         this.postMessage({ type: "messages", ...result, sessionId });
         break;
       }
@@ -377,6 +382,12 @@ export class SessionPanelProvider implements vscode.WebviewViewProvider {
         <button class="btn-sm" onclick="selectNoMessages()">Select None</button>
         <span class="loading-indicator" id="msgLoadingIndicator" style="display:none;">Loading...</span>
       </div>
+      <div class="filter-row msg-filter-row">
+        <input type="date" id="msgFilterFrom" title="From date" onchange="onMsgFilterChange()" />
+        <span style="font-size:11px;opacity:0.5;">–</span>
+        <input type="date" id="msgFilterTo" title="To date" onchange="onMsgFilterChange()" />
+        <button class="btn-sm" id="msgFilterClear" onclick="clearMsgFilter()" title="Clear filter" style="display:none;">&#10005;</button>
+      </div>
       <div id="messagesList" class="item-list"></div>
       <div class="pagination" id="messagesPagination"></div>
     </div>
@@ -455,6 +466,8 @@ var totalMessagesInSession = 0;
 var messageOffset = 0;
 var allMessagesFetched = false;
 var isFetchingMessages = false;
+var msgFilterFrom = "";
+var msgFilterTo = "";
 
 var checkedMsgIds = new Set();
 var partsCache = {};
@@ -550,6 +563,32 @@ function onFilterChange() {
   loadSessions();
 }
 
+function onMsgFilterChange() {
+  msgFilterFrom = document.getElementById("msgFilterFrom").value;
+  msgFilterTo = document.getElementById("msgFilterTo").value;
+  var clearBtn = document.getElementById("msgFilterClear");
+  if (clearBtn) clearBtn.style.display = (msgFilterFrom || msgFilterTo) ? "inline" : "none";
+  if (!currentSessionId) return;
+  resetMessages();
+  renderMessages();
+  refreshContentViewer();
+  fetchMoreMessages();
+}
+
+function clearMsgFilter() {
+  document.getElementById("msgFilterFrom").value = "";
+  document.getElementById("msgFilterTo").value = "";
+  var clearBtn = document.getElementById("msgFilterClear");
+  if (clearBtn) clearBtn.style.display = "none";
+  msgFilterFrom = "";
+  msgFilterTo = "";
+  if (!currentSessionId) return;
+  resetMessages();
+  renderMessages();
+  refreshContentViewer();
+  fetchMoreMessages();
+}
+
 function resetMessages() {
   allLoadedMessages = [];
   turns = [];
@@ -597,11 +636,15 @@ function fetchMoreMessages() {
   if (isFetchingMessages || allMessagesFetched) return;
   isFetchingMessages = true;
   showLoadingIndicator(true);
+  var fromTs = msgFilterFrom ? new Date(msgFilterFrom).getTime() : 0;
+  var toTs = msgFilterTo ? (new Date(msgFilterTo).getTime() + 86400000) : 0;
   vscode.postMessage({
     type: "getMessages",
     sessionId: currentSessionId,
     offset: messageOffset,
     limit: BATCH_SIZE,
+    fromDate: fromTs || undefined,
+    toDate: toTs || undefined,
   });
 }
 
@@ -1475,6 +1518,21 @@ init();
     align-items: center;
     flex-wrap: wrap;
   }
+  .msg-filter-row {
+    padding: 2px 12px 6px;
+    border-bottom: 1px solid rgba(255,255,255,0.04);
+  }
+  .msg-filter-row input[type="date"] {
+    flex: 1;
+    padding: 3px 6px;
+    background: var(--vscode-input-background);
+    color: var(--vscode-input-foreground);
+    border: 1px solid var(--vscode-input-border, rgba(255,255,255,0.1));
+    border-radius: 4px;
+    outline: none;
+    font-size: 11px;
+  }
+  .msg-filter-row input[type="date"]:focus { border-color: var(--vscode-focusBorder); }
 
   .btn-sm {
     padding: 3px 10px;

@@ -54,7 +54,7 @@ https://marketplace.visualstudio.com/items?itemName=zhaoxiuwei.oc-sessions
 ### From VSIX
 
 ```bash
-code --install-extension oc-sessions-0.8.0.vsix
+code --install-extension oc-sessions-0.8.1.vsix
 ```
 
 Get the latest VSIX from the [Releases](https://github.com/fdcp/oc-sessions/releases) page.

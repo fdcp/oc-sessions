@@ -220,14 +220,37 @@ export class DataProvider {
     };
   }
 
-  getMessages(sessionId: string, offset: number, limit: number): { messages: MessageInfo[]; total: number } {
-    const countRows = this.querySync("SELECT COUNT(*) as cnt FROM message WHERE session_id = ?", [sessionId]);
+  getMessages(
+    sessionId: string,
+    offset: number,
+    limit: number,
+    options?: { fromDate?: number; toDate?: number }
+  ): { messages: MessageInfo[]; total: number } {
+    const fromDate = options?.fromDate;
+    const toDate = options?.toDate;
+
+    const timeFilter = [
+      fromDate ? "time_created >= ?" : "",
+      toDate ? "time_created <= ?" : "",
+    ]
+      .filter(Boolean)
+      .join(" AND ");
+    const whereParts = ["session_id = ?", timeFilter].filter(Boolean).join(" AND ");
+    const timeParams: number[] = [
+      ...(fromDate ? [fromDate] : []),
+      ...(toDate ? [toDate] : []),
+    ];
+
+    const countRows = this.querySync(
+      `SELECT COUNT(*) as cnt FROM message WHERE ${whereParts}`,
+      [sessionId, ...timeParams]
+    );
     const total = (countRows[0]?.cnt as number) || 0;
 
     const rows = this.querySync(
       `SELECT id, session_id, time_created, data FROM message
-       WHERE session_id = ? ORDER BY time_created ASC LIMIT ? OFFSET ?`,
-      [sessionId, limit, offset]
+       WHERE ${whereParts} ORDER BY time_created ASC LIMIT ? OFFSET ?`,
+      [sessionId, ...timeParams, limit, offset]
     );
 
     return { total, messages: rows.map((row) => this.parseMessage(row)) };
