@@ -3,3 +3,4 @@ node_modules/
 out/
 dist/extension.js.map
 .DS_Store
+.opencode/skills/vscode-publish/.assets/credentials.json
