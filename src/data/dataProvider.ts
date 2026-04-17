@@ -265,29 +265,21 @@ export class DataProvider {
     let rows: Record<string, unknown>[] = [];
     try {
       rows = this.querySync(
-        `SELECT id, session_id, time_created, data FROM todo WHERE session_id = ? ORDER BY time_created ASC`,
+        `SELECT session_id, content, status, priority, position, time_created FROM todo WHERE session_id = ? ORDER BY position ASC`,
         [sessionId]
       );
     } catch {
       return [];
     }
-    return rows.map((row) => {
-      let data: Record<string, unknown> = {};
-      try {
-        data = JSON.parse((row.data as string) || "{}");
-      } catch {
-        data = {};
-      }
-      return {
-        id: row.id as string,
-        sessionId: row.session_id as string,
-        timeCreated: row.time_created as number,
-        title: (data.title as string) || (data.content as string) || "",
-        content: (data.content as string) || "",
-        status: (data.status as string) || "pending",
-        priority: (data.priority as string) || "medium",
-      };
-    });
+    return rows.map((row) => ({
+      id: `${row.session_id as string}_${row.position as number}`,
+      sessionId: row.session_id as string,
+      timeCreated: row.time_created as number,
+      title: (row.content as string) || "",
+      content: (row.content as string) || "",
+      status: (row.status as string) || "pending",
+      priority: (row.priority as string) || "medium",
+    }));
   }
 
   renameSession(sessionId: string, newTitle: string): void {

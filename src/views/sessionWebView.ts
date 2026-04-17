@@ -1332,10 +1332,11 @@ window.addEventListener("message", e => {
       updateDeleteSelectedBtn();
       loadSessions();
       break;
-    case "sessionRenamed":
+    case "sessionRenamed": {
       const s = sessionsData.sessions.find(x => x.id === msg.sessionId);
       if (s) { s.title = msg.newTitle; renderSessions(); }
       break;
+    }
     case "messageDeleted":
       allLoadedMessages = allLoadedMessages.filter(m => m.id !== msg.messageId);
       checkedMsgIds.delete(msg.messageId);
