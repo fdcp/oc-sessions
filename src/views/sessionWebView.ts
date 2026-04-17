@@ -422,7 +422,7 @@ export class SessionPanelProvider implements vscode.WebviewViewProvider {
         <label style="font-size:11px;opacity:0.6;cursor:pointer;">
           <input type="checkbox" id="checkAllSessions" onchange="onCheckAllSessions(this.checked)" style="margin-right:4px;" />All
         </label>
-        <button class="btn-sm btn-danger" id="deleteSelectedBtn" onclick="deleteSelectedSessions()" style="display:none;">Delete Selected</button>
+        <button class="btn-sm btn-danger" id="deleteSelectedBtn" onclick="deleteSelectedSessions()" style="display:none;">Delete Selected (<span id="deleteSelectedCount">0</span>)</button>
       </div>
       <div id="sessionsList" class="item-list"></div>
       <div class="pagination" id="sessionsPagination"></div>
@@ -812,7 +812,9 @@ function onCheckAllSessions(checked) {
 
 function updateDeleteSelectedBtn() {
   const btn = document.getElementById("deleteSelectedBtn");
+  const cnt = document.getElementById("deleteSelectedCount");
   if (btn) btn.style.display = checkedSessionIds.size > 0 ? "inline-block" : "none";
+  if (cnt) cnt.textContent = checkedSessionIds.size;
 }
 
 function onSessionCheck(sid, checked) {
