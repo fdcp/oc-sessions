@@ -50,7 +50,15 @@ export class SessionPanelProvider implements vscode.WebviewViewProvider {
       );
       return;
     }
-    this.view.webview.html = this.buildMainHtml(projects);
+    try {
+      this.view.webview.html = this.buildMainHtml(projects, dbPath);
+    } catch (e: unknown) {
+      const msg = e instanceof Error ? e.message : String(e);
+      const stack = e instanceof Error ? e.stack ?? "" : "";
+      this.view.webview.html = this.wrapHtml(
+        `<p style="color:red;">Error building HTML: ${msg}</p><p>Projects found: ${projects.length}</p><pre style="font-size:10px;overflow:auto;">${stack}</pre>`
+      );
+    }
   }
 
   private async handleMessage(msg: { type: string; [key: string]: unknown }): Promise<void> {
@@ -387,7 +395,7 @@ export class SessionPanelProvider implements vscode.WebviewViewProvider {
     }
   }
 
-  private buildMainHtml(projects: ProjectInfo[]): string {
+  private buildMainHtml(projects: ProjectInfo[], dbPath = "unknown"): string {
     const projectsJson = JSON.stringify(
       projects.map((p) => ({
         id: p.id,
@@ -402,6 +410,9 @@ export class SessionPanelProvider implements vscode.WebviewViewProvider {
 
     return this.wrapHtml(`
 <div id="app">
+
+  <!-- Debug: version and project count -->
+  <div style="padding:2px 8px;font-size:10px;color:#888;">v0.7.3 | ${projects.length} projects | db: ${dbPath}</div>
 
   <!-- Directory Selector -->
   <div class="panel-section dir-section">
