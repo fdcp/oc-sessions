@@ -99,9 +99,24 @@ Expected terminal output:
 ```
 
 **If error `already exists`**: version was not bumped — go back to Step 1.
-**If error `ECONNREFUSED`**: proxy conflict — the script already handles this, but check credentials.json proxy address.
+**If error `ECONNREFUSED`**: proxy conflict — **代理变量必须使用大写**。正确做法：
+```bash
+unset http_proxy https_proxy NO_PROXY no_proxy HTTP_PROXY HTTPS_PROXY
+export HTTPS_PROXY="http://172.16.5.77:8889"
+```
+小写的 `HTTPS_PROXY` 不会生效，必须用大写。
 
-## Output Standard
+### Step 8 — Verify with API
+
+发布后用 Marketplace API 验证（不是 HTML 页面）：
+```bash
+curl -s -X POST "https://marketplace.visualstudio.com/_apis/public/gallery/extensionquery" \
+  -H "Content-Type: application/json" \
+  -H "Accept: application/json;api-version=6.1-preview.1" \
+  -d '{"filters":[{"criteria":[{"filterType":7,"value":"zhaoxiuwei.oc-sessions"}]}],"flags":1}' \
+  | jq -r '.results[0].extensions[0].versions[0]'
+```
+确认 `flags` 为 `validated`（验证通过）或 `none`（验证失败）。如果 `none` 且有 `validationResultMessage` 提到 `secrets`，说明 vsix 含敏感信息，需修复 `.vscodeignore` 后重新发布。
 
 After completing all steps, report:
 
@@ -119,9 +134,10 @@ After completing all steps, report:
 | Symptom | Cause | Fix |
 |---|---|---|
 | `already exists` on marketplace publish | Version not bumped | Bump version in package.json first |
-| `ECONNREFUSED 172.16.5.2:8889` | Stale `HTTP_PROXY` env var | Script unsets all proxy vars before setting correct one |
+| `ECONNREFUSED 172.16.5.2:8889` | Stale `HTTP_PROXY` env var | **必须用大写**：先 unset 所有代理变量，再用大写重新 export：`unset http_proxy https_proxy NO_PROXY no_proxy HTTP_PROXY HTTPS_PROXY; export HTTPS_PROXY="http://..."` |
 | `yarn failed with exit code 127` | `yarn.lock` present but yarn not installed | Script deletes `yarn.lock` before publish |
 | `Aborted` on `vsce unpublish` | Interactive confirmation required | Not needed — just bump version and republish |
+| `SecretScanStep` 验证失败 | vsix 包含敏感信息（credentials.json） | 把 `.opencode/**` 加到 `.vscodeignore` 排除 |
 
 ## File Map
 
