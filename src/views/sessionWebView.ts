@@ -1,10 +1,18 @@
 import * as vscode from "vscode";
+import * as fs from "fs";
 import * as path from "path";
 import * as os from "os";
 import { DataProvider, ProjectInfo, SessionInfo, MessageInfo, PartInfo } from "../data/dataProvider";
+import { OpenCodeClient, contentHash, ModelOption } from "../opencode/opencodeClient";
+
+const OC_SUMMARY_DIR = "/workspace/oc_session_summary_continue";
 
 export class SessionPanelProvider implements vscode.WebviewViewProvider {
   private view: vscode.WebviewView | null = null;
+  private ocClient: OpenCodeClient | null = null;
+  private ocSessionId = "";
+  private ocMdPath = "";
+  private ocChatLog: Array<{ role: string; text: string }> = [];
 
   constructor(
     private dataProvider: DataProvider,
@@ -172,6 +180,154 @@ export class SessionPanelProvider implements vscode.WebviewViewProvider {
         vscode.window.showInformationMessage("Copied to clipboard.");
         break;
       }
+      case "ocStartServer": {
+        await this.handleOcStartServer(msg);
+        break;
+      }
+      case "ocSummarize": {
+        await this.handleOcSummarize(msg);
+        break;
+      }
+      case "ocSendMessage": {
+        await this.handleOcSendMessage(msg);
+        break;
+      }
+      case "ocEndSession": {
+        await this.handleOcEndSession();
+        break;
+      }
+    }
+  }
+
+  private async handleOcStartServer(msg: { [key: string]: unknown }): Promise<void> {
+    try {
+      const sourceSessionId = (msg.sessionId as string) || "unknown";
+      const contentMd = (msg.contentMd as string) || "";
+
+      fs.mkdirSync(OC_SUMMARY_DIR, { recursive: true });
+      const hash = contentHash(contentMd || sourceSessionId);
+      const mdPath = path.join(OC_SUMMARY_DIR, `session_${sourceSessionId}_${hash}.md`);
+      fs.writeFileSync(mdPath, contentMd, "utf-8");
+      this.ocMdPath = mdPath;
+      this.ocChatLog = [];
+
+      const baseUrl = "http://127.0.0.1:4096";
+      const serveCommand = "/root/.opencode/bin/opencode serve";
+      this.ocClient = new OpenCodeClient({
+        baseUrl,
+        directory: OC_SUMMARY_DIR,
+        serveCommand,
+        startupTimeoutMs: 30000,
+      });
+
+      if (!await this.ocClient.isHealthy()) {
+        await this.ocClient.startServer();
+      }
+
+      const mdFileName = path.basename(mdPath);
+      this.postMessage({ type: "ocServerStarted", mdPath: mdFileName });
+
+      const models = await this.ocClient.discoverModels();
+      this.postMessage({ type: "ocModels", models });
+    } catch (e: unknown) {
+      const errMsg = e instanceof Error ? e.message : String(e);
+      this.postMessage({ type: "ocError", error: errMsg });
+    }
+  }
+
+  private async handleOcSummarize(msg: { [key: string]: unknown }): Promise<void> {
+    try {
+      if (!this.ocClient) throw new Error("OpenCode server not started.");
+      const providerID = (msg.providerID as string) || "";
+      const modelID = (msg.modelID as string) || "";
+      const model = providerID && modelID ? { providerID, modelID } : undefined;
+
+      if (!this.ocSessionId) {
+        this.ocSessionId = await this.ocClient.createSession("OC Sessions Summary");
+      }
+
+      let promptText: string;
+      if (this.ocChatLog.length === 0) {
+        const mdContent = fs.readFileSync(this.ocMdPath, "utf-8");
+        promptText = "Please summarize the following session content:\n\n" + mdContent;
+      } else {
+        promptText = "Please compact and summarize the current session.";
+      }
+
+      const result = await this.ocClient.prompt({
+        sessionId: this.ocSessionId,
+        prompt: promptText,
+        model,
+        agent: "plan",
+      });
+
+      this.ocChatLog.push({ role: "user", text: promptText });
+      this.ocChatLog.push({ role: "assistant", text: result.output });
+      this.postMessage({ type: "ocSummarizeResult", output: result.output });
+    } catch (e: unknown) {
+      const errMsg = e instanceof Error ? e.message : String(e);
+      this.postMessage({ type: "ocError", error: errMsg });
+    }
+  }
+
+  private async handleOcSendMessage(msg: { [key: string]: unknown }): Promise<void> {
+    try {
+      if (!this.ocClient || !this.ocSessionId) throw new Error("No active OpenCode session.");
+      const text = (msg.text as string) || "";
+      const providerID = (msg.providerID as string) || "";
+      const modelID = (msg.modelID as string) || "";
+      const model = providerID && modelID ? { providerID, modelID } : undefined;
+
+      const result = await this.ocClient.prompt({
+        sessionId: this.ocSessionId,
+        prompt: text,
+        model,
+        agent: "plan",
+      });
+
+      this.ocChatLog.push({ role: "user", text });
+      this.ocChatLog.push({ role: "assistant", text: result.output });
+      this.postMessage({ type: "ocMessageResult", output: result.output, userText: text });
+    } catch (e: unknown) {
+      const errMsg = e instanceof Error ? e.message : String(e);
+      this.postMessage({ type: "ocError", error: errMsg });
+    }
+  }
+
+  private async handleOcEndSession(): Promise<void> {
+    try {
+      if (this.ocClient && this.ocSessionId && this.ocMdPath && this.ocChatLog.length > 0) {
+        const appendLines: string[] = ["\n\n---\n\n## OpenCode Summary Session\n"];
+        for (const entry of this.ocChatLog) {
+          appendLines.push(`### [${entry.role.toUpperCase()}]\n\n${entry.text}\n`);
+        }
+        const saveContent = appendLines.join("\n");
+        await this.ocClient.prompt({
+          sessionId: this.ocSessionId,
+          prompt: `Please write the following content to the end of the file ${this.ocMdPath}:\n\n${saveContent}`,
+          agent: "build",
+        });
+      }
+    } catch {
+      // fallback: direct write if build agent fails
+      try {
+        if (this.ocMdPath && this.ocChatLog.length > 0) {
+          const appendLines: string[] = ["\n\n---\n\n## OpenCode Summary Session\n"];
+          for (const entry of this.ocChatLog) {
+            appendLines.push(`### [${entry.role.toUpperCase()}]\n\n${entry.text}\n`);
+          }
+          fs.appendFileSync(this.ocMdPath, appendLines.join("\n"), "utf-8");
+        }
+      } catch { /* ignore */ }
+    } finally {
+      if (this.ocSessionId && this.ocClient) {
+        try { await this.ocClient.abortSession(this.ocSessionId); } catch { /* ignore */ }
+      }
+      this.ocSessionId = "";
+      this.ocClient = null;
+      this.ocMdPath = "";
+      this.ocChatLog = [];
+      this.postMessage({ type: "ocSessionEnded" });
     }
   }
 
@@ -435,9 +591,37 @@ export class SessionPanelProvider implements vscode.WebviewViewProvider {
         </div>
       </div>
     </div>
+    <div id="tabOpencode" class="tab-content" style="display:none;">
+      <!-- Summary Area -->
+      <div class="oc-summary-area" id="ocSummaryArea">
+        <span class="oc-placeholder">Summary will appear here after Summarize.</span>
+      </div>
+      <!-- Chat Messages Area -->
+      <div class="oc-chat-area" id="ocChatArea">
+        <span class="oc-placeholder">Chat messages will appear here.</span>
+      </div>
+      <!-- Input Area -->
+      <div class="oc-input-row" id="ocInputRow">
+        <textarea id="ocInputBox" class="oc-input-box" placeholder="Type a message..." disabled
+          onkeydown="if(event.key==='Enter'&&!event.shiftKey){event.preventDefault();ocSendMessage();}"></textarea>
+        <button class="oc-send-btn" id="ocSendBtn" onclick="ocSendMessage()" disabled>Send</button>
+      </div>
+      <!-- Controls row 1: RUN + Model + Quality -->
+      <div class="oc-controls-row">
+        <button class="oc-btn oc-btn-run" id="ocRunBtn" onclick="ocStartServer()">RUN OpenCode</button>
+        <select id="ocModelSelect" class="oc-select" disabled><option value="">Model</option></select>
+        <select id="ocQualitySelect" class="oc-select" disabled><option value="">Quality</option></select>
+      </div>
+      <!-- Controls row 2: Summarize + End Session -->
+      <div class="oc-controls-row">
+        <button class="oc-btn oc-btn-summarize" id="ocSummarizeBtn" onclick="ocSummarize()" disabled>Summarize</button>
+        <button class="oc-btn oc-btn-end" id="ocEndBtn" onclick="ocEndSession()" disabled>End Session</button>
+      </div>
+    </div>
     <div class="bottom-tab-bar">
       <button class="bottom-tab active" id="tabBtnDisplay" onclick="switchBottomTab('display')">DISPLAY</button>
       <button class="bottom-tab" id="tabBtnExport" onclick="switchBottomTab('export')">EXPORT</button>
+      <button class="bottom-tab" id="tabBtnOpencode" onclick="switchBottomTab('opencode')">OPENCODE</button>
     </div>
   </div>
 
@@ -1146,8 +1330,10 @@ function togglePanel(name) {
 function switchBottomTab(tab) {
   document.getElementById("tabDisplay").style.display = tab === "display" ? "block" : "none";
   document.getElementById("tabExport").style.display = tab === "export" ? "block" : "none";
+  document.getElementById("tabOpencode").style.display = tab === "opencode" ? "block" : "none";
   document.getElementById("tabBtnDisplay").classList.toggle("active", tab === "display");
   document.getElementById("tabBtnExport").classList.toggle("active", tab === "export");
+  document.getElementById("tabBtnOpencode").classList.toggle("active", tab === "opencode");
 }
 
 function esc(s) {
@@ -1260,6 +1446,38 @@ window.addEventListener("message", function(e) {
       renderMessages();
       refreshContentViewer();
       break;
+    case "ocServerStarted":
+      ocSetState("running");
+      break;
+    case "ocModels":
+      ocPopulateModels(msg.models);
+      ocPopulateQuality(msg.models);
+      break;
+    case "ocSummarizeResult": {
+      var sumArea = document.getElementById("ocSummaryArea");
+      sumArea.innerHTML = '<div class="oc-summary-text">' + esc(msg.output) + '</div>';
+      ocAppendChat("assistant", msg.output);
+      document.getElementById("ocSummarizeBtn").textContent = "Summarize";
+      document.getElementById("ocSummarizeBtn").disabled = false;
+      ocSetState("chatting");
+      break;
+    }
+    case "ocMessageResult":
+      ocAppendChat("assistant", msg.output);
+      document.getElementById("ocSendBtn").disabled = false;
+      document.getElementById("ocSendBtn").textContent = "Send";
+      break;
+    case "ocError":
+      ocAppendChat("assistant", "[Error] " + msg.error);
+      document.getElementById("ocSummarizeBtn").textContent = "Summarize";
+      document.getElementById("ocSummarizeBtn").disabled = false;
+      document.getElementById("ocSendBtn").disabled = false;
+      document.getElementById("ocSendBtn").textContent = "Send";
+      if (ocState === "starting") ocSetState("initial");
+      break;
+    case "ocSessionEnded":
+      ocReset();
+      break;
   }
 });
 
@@ -1268,6 +1486,172 @@ function formatTs(ts) {
   var d = ts > 1e12 ? new Date(ts) : new Date(ts * 1000);
   var pad = function(n) { return String(n).padStart(2, "0"); };
   return d.getFullYear() + "-" + pad(d.getMonth()+1) + "-" + pad(d.getDate()) + " " + pad(d.getHours()) + ":" + pad(d.getMinutes());
+}
+
+// --- OPENCODE Tab State & Functions ---
+var ocState = "initial"; // initial | starting | running | chatting
+var ocModels = [];
+var ocSelectedModel = null;
+
+function ocGetContentMd() {
+  var ids = Array.from(checkedMsgIds);
+  var msgs = ids.length > 0
+    ? allLoadedMessages.filter(function(m) { return ids.indexOf(m.id) >= 0; })
+    : allLoadedMessages;
+  if (msgs.length === 0) return "";
+  var lines = ["# Session Content\\n"];
+  msgs.forEach(function(m) {
+    lines.push("## " + (m.role || "unknown").toUpperCase() + " (" + (m.timeFormatted || "") + ")\\n");
+    var parts = partsCache[m.id];
+    if (parts && parts.length > 0) {
+      parts.forEach(function(p) {
+        if (p.type === "text" && p.content) lines.push(p.content + "\\n");
+        else if (p.type === "reasoning" && p.content) lines.push("> " + p.content + "\\n");
+        else if (p.type === "tool-invocation" && p.toolName) lines.push("**Tool**: " + p.toolName + "\\n");
+      });
+    }
+    lines.push("---\\n");
+  });
+  return lines.join("\\n");
+}
+
+function ocSetState(state) {
+  ocState = state;
+  var runBtn = document.getElementById("ocRunBtn");
+  var modelSel = document.getElementById("ocModelSelect");
+  var qualitySel = document.getElementById("ocQualitySelect");
+  var sumBtn = document.getElementById("ocSummarizeBtn");
+  var endBtn = document.getElementById("ocEndBtn");
+  var inputBox = document.getElementById("ocInputBox");
+  var sendBtn = document.getElementById("ocSendBtn");
+
+  if (state === "initial") {
+    runBtn.textContent = "RUN OpenCode";
+    runBtn.className = "oc-btn oc-btn-run";
+    runBtn.disabled = false;
+    modelSel.disabled = true;
+    qualitySel.disabled = true;
+    sumBtn.disabled = true;
+    endBtn.disabled = true;
+    inputBox.disabled = true;
+    sendBtn.disabled = true;
+  } else if (state === "starting") {
+    runBtn.textContent = "Starting...";
+    runBtn.className = "oc-btn oc-btn-run";
+    runBtn.disabled = true;
+    modelSel.disabled = true;
+    qualitySel.disabled = true;
+    sumBtn.disabled = true;
+    endBtn.disabled = true;
+    inputBox.disabled = true;
+    sendBtn.disabled = true;
+  } else if (state === "running") {
+    runBtn.textContent = "Running";
+    runBtn.className = "oc-btn oc-btn-run oc-btn-running";
+    runBtn.disabled = true;
+    modelSel.disabled = false;
+    qualitySel.disabled = false;
+    sumBtn.disabled = false;
+    endBtn.disabled = true;
+    inputBox.disabled = true;
+    sendBtn.disabled = true;
+  } else if (state === "chatting") {
+    runBtn.textContent = "Running";
+    runBtn.className = "oc-btn oc-btn-run oc-btn-running";
+    runBtn.disabled = true;
+    modelSel.disabled = false;
+    qualitySel.disabled = false;
+    sumBtn.disabled = false;
+    endBtn.disabled = false;
+    inputBox.disabled = false;
+    sendBtn.disabled = false;
+  }
+}
+
+function ocStartServer() {
+  if (ocState !== "initial") return;
+  ocSetState("starting");
+  var contentMd = ocGetContentMd();
+  vscode.postMessage({ type: "ocStartServer", sessionId: currentSessionId || "unknown", contentMd: contentMd });
+}
+
+function ocSummarize() {
+  if (ocState !== "running" && ocState !== "chatting") return;
+  var sel = document.getElementById("ocModelSelect");
+  var val = sel.value;
+  var providerID = "", modelID = "";
+  if (val) { var p = val.split("::"); providerID = p[0] || ""; modelID = p[1] || ""; }
+  var sumBtn = document.getElementById("ocSummarizeBtn");
+  sumBtn.disabled = true;
+  sumBtn.textContent = "Summarizing...";
+  vscode.postMessage({ type: "ocSummarize", providerID: providerID, modelID: modelID });
+}
+
+function ocSendMessage() {
+  if (ocState !== "chatting") return;
+  var inputBox = document.getElementById("ocInputBox");
+  var text = inputBox.value.trim();
+  if (!text) return;
+  inputBox.value = "";
+  var sel = document.getElementById("ocModelSelect");
+  var val = sel.value;
+  var providerID = "", modelID = "";
+  if (val) { var p = val.split("::"); providerID = p[0] || ""; modelID = p[1] || ""; }
+  ocAppendChat("user", text);
+  var sendBtn = document.getElementById("ocSendBtn");
+  sendBtn.disabled = true;
+  sendBtn.textContent = "...";
+  vscode.postMessage({ type: "ocSendMessage", text: text, providerID: providerID, modelID: modelID });
+}
+
+function ocEndSession() {
+  if (ocState !== "chatting") return;
+  var endBtn = document.getElementById("ocEndBtn");
+  endBtn.disabled = true;
+  endBtn.textContent = "Ending...";
+  vscode.postMessage({ type: "ocEndSession" });
+}
+
+function ocAppendChat(role, text) {
+  var area = document.getElementById("ocChatArea");
+  if (area.querySelector(".oc-placeholder")) area.innerHTML = "";
+  var div = document.createElement("div");
+  div.className = "oc-chat-msg";
+  var badge = role === "user"
+    ? '<span class="oc-badge-you">YOU</span>'
+    : '<span class="oc-badge-ai">AI</span>';
+  div.innerHTML = badge + '<div class="oc-msg-text">' + esc(text) + '</div>';
+  area.appendChild(div);
+  area.scrollTop = area.scrollHeight;
+}
+
+function ocPopulateModels(models) {
+  ocModels = models || [];
+  var sel = document.getElementById("ocModelSelect");
+  sel.innerHTML = '<option value="">-- Select Model --</option>';
+  models.forEach(function(m) {
+    var opt = document.createElement("option");
+    opt.value = m.providerID + "::" + m.modelID;
+    opt.textContent = m.label || (m.providerID + " / " + m.modelID);
+    sel.appendChild(opt);
+  });
+  // auto-select first
+  if (models.length > 0) sel.selectedIndex = 1;
+}
+
+function ocPopulateQuality(models) {
+  var sel = document.getElementById("ocQualitySelect");
+  sel.innerHTML = '<option value="">Auto</option>';
+  // quality options populated when model changes (future enhancement)
+}
+
+function ocReset() {
+  ocSetState("initial");
+  document.getElementById("ocSummaryArea").innerHTML = '<span class="oc-placeholder">Summary will appear here after Summarize.</span>';
+  document.getElementById("ocChatArea").innerHTML = '<span class="oc-placeholder">Chat messages will appear here.</span>';
+  document.getElementById("ocInputBox").value = "";
+  document.getElementById("ocModelSelect").innerHTML = '<option value="">Model</option>';
+  document.getElementById("ocQualitySelect").innerHTML = '<option value="">Quality</option>';
 }
 
 init();
@@ -1735,6 +2119,68 @@ init();
   .bottom-tab:last-child { border-right: none; }
   .bottom-tab:hover { opacity: 0.85; }
   .bottom-tab.active { opacity: 1; color: #2979ff; border-bottom: 2px solid #2979ff; }
+
+  /* OPENCODE Tab Styles */
+  #tabOpencode { display: flex; flex-direction: column; height: 500px; }
+  .oc-summary-area {
+    flex: 1; overflow-y: auto; padding: 8px 10px;
+    border-bottom: 1px solid var(--vscode-panel-border);
+    font-size: 12px; line-height: 1.5;
+  }
+  .oc-chat-area {
+    flex: 1.5; overflow-y: auto; padding: 8px 10px;
+    border-bottom: 1px solid var(--vscode-panel-border);
+  }
+  .oc-input-row {
+    flex: 0.5; display: flex; gap: 0; padding: 6px 10px; min-height: 60px;
+  }
+  .oc-input-box {
+    flex: 1; resize: none; padding: 8px; font-size: 12px;
+    background: #2f2f2f; color: var(--vscode-foreground);
+    border: 2px solid #2979ff; border-radius: 8px 0 0 8px;
+    outline: none; font-family: inherit;
+  }
+  .oc-input-box:disabled { border-color: #555; opacity: 0.5; }
+  .oc-send-btn {
+    width: 50px; background: #2979ff; color: #fff; border: none;
+    border-radius: 0 8px 8px 0; cursor: pointer; font-size: 12px; font-weight: 600;
+  }
+  .oc-send-btn:disabled { opacity: 0.4; cursor: default; }
+  .oc-controls-row {
+    display: flex; gap: 8px; padding: 6px 10px; align-items: center;
+  }
+  .oc-btn {
+    padding: 5px 14px; border: none; border-radius: 14px;
+    font-size: 12px; font-weight: 600; cursor: pointer; color: #fff;
+  }
+  .oc-btn:disabled { opacity: 0.4; cursor: default; }
+  .oc-btn-run { background: #404040; }
+  .oc-btn-run.oc-btn-running { background: #2ea44a; }
+  .oc-btn-summarize { background: #2979ff; }
+  .oc-btn-end { background: #404040; }
+  .oc-select {
+    padding: 4px 8px; font-size: 11px; background: #2f2f2f;
+    color: var(--vscode-foreground); border: 1px solid #555;
+    border-radius: 6px; outline: none;
+  }
+  .oc-select:disabled { opacity: 0.4; }
+  .oc-chat-msg {
+    display: flex; gap: 8px; padding: 6px 0; align-items: flex-start;
+  }
+  .oc-badge-you {
+    background: #d4882a; color: #fff; font-size: 10px; font-weight: 700;
+    padding: 2px 8px; border-radius: 10px; white-space: nowrap;
+  }
+  .oc-badge-ai {
+    background: #2979ff; color: #fff; font-size: 10px; font-weight: 700;
+    padding: 2px 8px; border-radius: 10px; white-space: nowrap;
+  }
+  .oc-msg-text {
+    font-size: 12px; line-height: 1.5; white-space: pre-wrap; word-break: break-word;
+    background: #262626; border: 1px solid #333; border-radius: 8px; padding: 8px 10px; flex: 1;
+  }
+  .oc-placeholder { color: #666; font-size: 12px; font-style: italic; padding: 12px; }
+  .oc-summary-text { white-space: pre-wrap; word-break: break-word; }
 </style>
 </head>
 <body>
