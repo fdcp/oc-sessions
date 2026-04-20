@@ -132,14 +132,46 @@ export class DataProvider {
               (SELECT COUNT(*) FROM session s WHERE s.project_id = p.id) as session_count
        FROM project p ORDER BY p.time_updated DESC`
     );
-    return rows.map((row) => ({
-      id: row.id as string,
-      worktree: row.worktree as string,
-      name: (row.name as string) || path.basename(row.worktree as string),
-      timeCreated: row.time_created as number,
-      timeUpdated: row.time_updated as number,
-      sessionCount: row.session_count as number,
-    }));
+    const result: ProjectInfo[] = [];
+    for (const row of rows) {
+      const worktree = row.worktree as string;
+      if (worktree === "/") {
+        const dirRows = this.querySync(
+          `SELECT s.directory,
+                  MAX(s.time_updated) as max_updated,
+                  MIN(s.time_created) as min_created,
+                  COUNT(*) as cnt
+           FROM session s
+           WHERE s.project_id = ?
+             AND (SELECT COUNT(*) FROM message m WHERE m.session_id = s.id) > 0
+             AND s.directory IS NOT NULL AND s.directory != ''
+           GROUP BY s.directory
+           ORDER BY max_updated DESC`,
+          [row.id as string]
+        );
+        for (const dr of dirRows) {
+          const dir = dr.directory as string;
+          result.push({
+            id: `${row.id as string}::${dir}`,
+            worktree: dir,
+            name: path.basename(dir) || dir,
+            timeCreated: dr.min_created as number,
+            timeUpdated: dr.max_updated as number,
+            sessionCount: dr.cnt as number,
+          });
+        }
+      } else {
+        result.push({
+          id: row.id as string,
+          worktree,
+          name: (row.name as string) || path.basename(worktree),
+          timeCreated: row.time_created as number,
+          timeUpdated: row.time_updated as number,
+          sessionCount: row.session_count as number,
+        });
+      }
+    }
+    return result;
   }
 
   getSessions(
@@ -148,11 +180,20 @@ export class DataProvider {
     limit: number,
     opts: GetSessionsOpts = {}
   ): { sessions: SessionInfo[]; total: number } {
+    const sepIdx = projectId.indexOf("::");
+    const realProjectId = sepIdx >= 0 ? projectId.slice(0, sepIdx) : projectId;
+    const directoryFilter = sepIdx >= 0 ? projectId.slice(sepIdx + 2) : null;
+
     const conditions: string[] = [
       "s.project_id = ?",
       "(SELECT COUNT(*) FROM message m WHERE m.session_id = s.id) > 0",
     ];
-    const params: (string | number)[] = [projectId];
+    const params: (string | number)[] = [realProjectId];
+
+    if (directoryFilter) {
+      conditions.push("s.directory = ?");
+      params.push(directoryFilter);
+    }
 
     if (opts.keyword && opts.keyword.trim()) {
       conditions.push("LOWER(s.title) LIKE ?");

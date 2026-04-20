@@ -29,6 +29,7 @@ export interface PromptRequest {
   messageID?: string;
   model?: { providerID: string; modelID: string };
   agent?: string;
+  tools?: { [key: string]: boolean };
 }
 
 export interface PromptResult {
@@ -308,6 +309,119 @@ export class OpenCodeClient {
       messageID,
       output: extractOutputFromParts(parts),
     };
+  }
+
+  async promptStream(
+    request: PromptRequest,
+    abortFlag: { abort: boolean },
+    onDelta: (delta: string) => void,
+    onDone: (output: string) => void,
+    onError: (err: Error) => void
+  ): Promise<void> {
+    const client = await this.getClient();
+    const msgID = request.messageID || generateMessageID();
+
+    let sseResult: { stream: AsyncGenerator<unknown> } | undefined;
+    try {
+      sseResult = await client.global.event();
+    } catch (e) {
+      onError(e instanceof Error ? e : new Error(String(e)));
+      return;
+    }
+
+    if (!sseResult) { onError(new Error("Failed to open event stream.")); return; }
+
+    await client.session.promptAsync({
+      sessionID: request.sessionId,
+      directory: this.settings.directory,
+      messageID: msgID,
+      model: request.model,
+      agent: request.agent,
+      tools: request.tools,
+      parts: [{ type: "text", text: request.prompt }],
+    });
+
+    const accumulated: string[] = [];
+    let done = false;
+    let lastDeltaTime = Date.now();
+    const NO_DELTA_TIMEOUT_MS = 60000;
+    const promptSentAt = Date.now();
+    const IDLE_GRACE_MS = 1500;
+
+    const monitor = setInterval(async () => {
+      if (done) return;
+      const timedOut = Date.now() - lastDeltaTime > NO_DELTA_TIMEOUT_MS;
+      if (abortFlag.abort || timedOut) {
+        done = true;
+        try { await sseResult!.stream.return?.(undefined); } catch { /* ignore */ }
+      }
+    }, 200);
+
+    try {
+      for await (const rawEvent of sseResult.stream) {
+        if (done || abortFlag.abort) break;
+        const evt = isRecord(rawEvent) ? rawEvent
+          : (isRecord((rawEvent as Record<string, unknown>)?.[200])
+            ? (rawEvent as Record<string, unknown>)[200]
+            : rawEvent);
+        const payload = isRecord(evt) && isRecord(evt.payload) ? evt.payload
+          : (isRecord(evt) ? evt : null);
+        if (!payload) continue;
+
+        const type = toTrimmedString(payload.type);
+        const props = isRecord(payload.properties) ? payload.properties : null;
+
+        if (type === "message.part.delta" && props) {
+          const sid = toTrimmedString(props.sessionID);
+          if (sid !== request.sessionId) continue;
+          const field = toTrimmedString(props.field);
+          if (field !== "text") continue;
+          const delta = toTrimmedString(props.delta);
+          if (delta) {
+            lastDeltaTime = Date.now();
+            accumulated.push(delta);
+            onDelta(delta);
+          }
+        } else if (type === "session.idle" && props) {
+          const sid = toTrimmedString(props.sessionID);
+          if (sid !== request.sessionId) continue;
+          if (Date.now() - promptSentAt < IDLE_GRACE_MS) continue;
+          done = true;
+          onDone(accumulated.join(""));
+          break;
+        } else if (type === "session.status" && props) {
+          const sid = toTrimmedString(props.sessionID);
+          if (sid !== request.sessionId) continue;
+          if (Date.now() - promptSentAt < IDLE_GRACE_MS) continue;
+          const status = isRecord(props.status) ? props.status : null;
+          if (status && toTrimmedString(status.type) === "idle") {
+            done = true;
+            onDone(accumulated.join(""));
+            break;
+          }
+        }
+      }
+      if (!done) {
+        done = true;
+        if (!abortFlag.abort) onDone(accumulated.join(""));
+      }
+    } catch (e) {
+      if (!done && !abortFlag.abort) {
+        onError(e instanceof Error ? e : new Error(String(e)));
+      }
+    } finally {
+      clearInterval(monitor);
+      try { await sseResult.stream.return?.(undefined); } catch { /* ignore */ }
+    }
+  }
+
+  async compactSession(sessionId: string, model?: { providerID: string; modelID: string }): Promise<void> {
+    const client = await this.getClient();
+    await client.session.summarize({
+      sessionID: sessionId,
+      directory: this.settings.directory,
+      ...(model ? { providerID: model.providerID, modelID: model.modelID } : {}),
+    });
   }
 
   async abortSession(sessionId: string): Promise<void> {

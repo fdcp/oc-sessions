@@ -13,6 +13,7 @@ export class SessionPanelProvider implements vscode.WebviewViewProvider {
   private ocSessionId = "";
   private ocMdPath = "";
   private ocChatLog: Array<{ role: string; text: string }> = [];
+  private ocStreamAbortFlag = { abort: false };
 
   constructor(
     private dataProvider: DataProvider,
@@ -196,6 +197,14 @@ export class SessionPanelProvider implements vscode.WebviewViewProvider {
         await this.handleOcEndSession();
         break;
       }
+      case "ocStop": {
+        this.ocStreamAbortFlag.abort = true;
+        if (this.ocClient && this.ocSessionId) {
+          try { await this.ocClient.abortSession(this.ocSessionId); } catch { /* ignore */ }
+        }
+        this.postMessage({ type: "ocStopped" });
+        break;
+      }
     }
   }
 
@@ -246,24 +255,25 @@ export class SessionPanelProvider implements vscode.WebviewViewProvider {
         this.ocSessionId = await this.ocClient.createSession("OC Sessions Summary");
       }
 
-      let promptText: string;
-      if (this.ocChatLog.length === 0) {
-        const mdContent = fs.readFileSync(this.ocMdPath, "utf-8");
-        promptText = "Please summarize the following session content:\n\n" + mdContent;
-      } else {
-        promptText = "Please compact and summarize the current session.";
-      }
+      const sessionId = this.ocSessionId;
+      const chatLog = this.ocChatLog;
 
-      const result = await this.ocClient.prompt({
-        sessionId: this.ocSessionId,
-        prompt: promptText,
-        model,
-        agent: "plan",
-      });
+      const promptText = chatLog.length === 0
+        ? "请用中文总结以下会话内容：\n\n" + fs.readFileSync(this.ocMdPath, "utf-8")
+        : "请用中文总结当前会话内容。";
 
-      this.ocChatLog.push({ role: "user", text: promptText });
-      this.ocChatLog.push({ role: "assistant", text: result.output });
-      this.postMessage({ type: "ocSummarizeResult", output: result.output });
+      chatLog.push({ role: "user", text: promptText });
+      this.ocStreamAbortFlag = { abort: false };
+      await this.ocClient.promptStream(
+        { sessionId, prompt: promptText, model, tools: {} },
+        this.ocStreamAbortFlag,
+        (delta) => this.postMessage({ type: "ocSummarizeDelta", delta }),
+        (output) => {
+          chatLog.push({ role: "assistant", text: output });
+          this.postMessage({ type: "ocSummarizeResult", output });
+        },
+        (err) => this.postMessage({ type: "ocError", error: err.message })
+      );
     } catch (e: unknown) {
       const errMsg = e instanceof Error ? e.message : String(e);
       this.postMessage({ type: "ocError", error: errMsg });
@@ -278,16 +288,21 @@ export class SessionPanelProvider implements vscode.WebviewViewProvider {
       const modelID = (msg.modelID as string) || "";
       const model = providerID && modelID ? { providerID, modelID } : undefined;
 
-      const result = await this.ocClient.prompt({
-        sessionId: this.ocSessionId,
-        prompt: text,
-        model,
-        agent: "plan",
-      });
+      const sessionId = this.ocSessionId;
+      const chatLog = this.ocChatLog;
+      chatLog.push({ role: "user", text });
 
-      this.ocChatLog.push({ role: "user", text });
-      this.ocChatLog.push({ role: "assistant", text: result.output });
-      this.postMessage({ type: "ocMessageResult", output: result.output, userText: text });
+      this.ocStreamAbortFlag = { abort: false };
+      await this.ocClient.promptStream(
+        { sessionId, prompt: text, model },
+        this.ocStreamAbortFlag,
+        (delta) => this.postMessage({ type: "ocMessageDelta", delta }),
+        (output) => {
+          chatLog.push({ role: "assistant", text: output });
+          this.postMessage({ type: "ocMessageResult", output, userText: text });
+        },
+        (err) => this.postMessage({ type: "ocError", error: err.message })
+      );
     } catch (e: unknown) {
       const errMsg = e instanceof Error ? e.message : String(e);
       this.postMessage({ type: "ocError", error: errMsg });
@@ -591,31 +606,40 @@ export class SessionPanelProvider implements vscode.WebviewViewProvider {
         </div>
       </div>
     </div>
-    <div id="tabOpencode" class="tab-content" style="display:none;">
-      <!-- Summary Area -->
-      <div class="oc-summary-area" id="ocSummaryArea">
-        <span class="oc-placeholder">Summary will appear here after Summarize.</span>
+    <div id="tabOpencode" style="display:none;">
+      <!-- Session Header (fixed top) -->
+      <div class="oc-session-header" id="ocSessionHeader">
+        <span id="ocSessionTitle">Session: --</span>
       </div>
-      <!-- Chat Messages Area -->
-      <div class="oc-chat-area" id="ocChatArea">
-        <span class="oc-placeholder">Chat messages will appear here.</span>
+      <!-- Main flexible area: Summary(0.3) + Chat(0.5) + Input(0.2) -->
+      <div class="oc-main-area" id="ocMainArea">
+        <div class="oc-summary-section" id="ocSummarySection">
+          <div class="oc-summary-title">Summary</div>
+          <div class="oc-summary-content" id="ocSummaryArea">
+            <span class="oc-placeholder">Summary will appear here after Summarize.</span>
+          </div>
+        </div>
+        <div class="oc-chat-section" id="ocChatSection">
+          <div class="oc-chat-content" id="ocChatArea">
+            <span class="oc-placeholder">Chat messages will appear here.</span>
+          </div>
+        </div>
+        <div class="oc-input-row" id="ocInputRow">
+          <textarea id="ocInputBox" class="oc-input-box" placeholder="Type a message..." disabled></textarea>
+          <button class="oc-send-btn" id="ocSendBtn" onclick="ocSendMessage()" disabled>Send</button>
+        </div>
       </div>
-      <!-- Input Area -->
-      <div class="oc-input-row" id="ocInputRow">
-        <textarea id="ocInputBox" class="oc-input-box" placeholder="Type a message..." disabled
-          onkeydown="if(event.key==='Enter'&&!event.shiftKey){event.preventDefault();ocSendMessage();}"></textarea>
-        <button class="oc-send-btn" id="ocSendBtn" onclick="ocSendMessage()" disabled>Send</button>
-      </div>
-      <!-- Controls row 1: RUN + Model + Quality -->
-      <div class="oc-controls-row">
-        <button class="oc-btn oc-btn-run" id="ocRunBtn" onclick="ocStartServer()">RUN OpenCode</button>
+      <!-- Model Row (fixed height) -->
+      <div class="oc-model-row">
         <select id="ocModelSelect" class="oc-select" disabled><option value="">Model</option></select>
         <select id="ocQualitySelect" class="oc-select" disabled><option value="">Quality</option></select>
       </div>
-      <!-- Controls row 2: Summarize + End Session -->
+      <!-- Controls Row (fixed height, 4 buttons) -->
       <div class="oc-controls-row">
+        <button class="oc-btn oc-btn-run" id="ocRunBtn" onclick="ocStartServer()">RUN OpenCode</button>
         <button class="oc-btn oc-btn-summarize" id="ocSummarizeBtn" onclick="ocSummarize()" disabled>Summarize</button>
-        <button class="oc-btn oc-btn-end" id="ocEndBtn" onclick="ocEndSession()" disabled>End Session</button>
+        <button class="oc-btn oc-btn-stop" id="ocStopBtn" onclick="ocStop()" disabled>Stop</button>
+        <button class="oc-btn oc-btn-end" id="ocEndBtn" onclick="ocEndSession()" disabled>End</button>
       </div>
     </div>
     <div class="bottom-tab-bar">
@@ -666,7 +690,7 @@ var focusedTurnIdx = -1;
 
 function init() {
   var sel = document.getElementById("projectSelect");
-  projects.forEach(function(p) {
+  projects.filter(function(p) { return p.sessionCount > 0; }).forEach(function(p) {
     var opt = document.createElement("option");
     opt.value = p.id;
     opt.textContent = p.worktree + " (" + p.sessionCount + " sessions)";
@@ -1330,10 +1354,12 @@ function togglePanel(name) {
 function switchBottomTab(tab) {
   document.getElementById("tabDisplay").style.display = tab === "display" ? "block" : "none";
   document.getElementById("tabExport").style.display = tab === "export" ? "block" : "none";
-  document.getElementById("tabOpencode").style.display = tab === "opencode" ? "block" : "none";
+  document.getElementById("tabOpencode").style.display = tab === "opencode" ? "flex" : "none";
   document.getElementById("tabBtnDisplay").classList.toggle("active", tab === "display");
   document.getElementById("tabBtnExport").classList.toggle("active", tab === "export");
   document.getElementById("tabBtnOpencode").classList.toggle("active", tab === "opencode");
+  var isOpencode = tab === "opencode";
+  document.getElementById("app").classList.toggle("opencode-mode", isOpencode);
 }
 
 function esc(s) {
@@ -1453,17 +1479,35 @@ window.addEventListener("message", function(e) {
       ocPopulateModels(msg.models);
       ocPopulateQuality(msg.models);
       break;
+    case "ocSummarizeDelta":
+      ocStreamDelta("summary", msg.delta);
+      break;
     case "ocSummarizeResult": {
       var sumArea = document.getElementById("ocSummaryArea");
+      ocFlushStream("summary", msg.output);
       sumArea.innerHTML = '<div class="oc-summary-text">' + esc(msg.output) + '</div>';
-      ocAppendChat("assistant", msg.output);
-      document.getElementById("ocSummarizeBtn").textContent = "Summarize";
-      document.getElementById("ocSummarizeBtn").disabled = false;
+      var sumBtnEl = document.getElementById("ocSummarizeBtn");
+      sumBtnEl.textContent = "Summarized";
+      sumBtnEl.disabled = false;
       ocSetState("chatting");
       break;
     }
+    case "ocMessageDelta":
+      ocStreamDelta("chat", msg.delta);
+      break;
     case "ocMessageResult":
-      ocAppendChat("assistant", msg.output);
+      ocFlushStream("chat", msg.output);
+      document.getElementById("ocSendBtn").disabled = false;
+      document.getElementById("ocSendBtn").textContent = "Send";
+      var sumBtnAfterMsg = document.getElementById("ocSummarizeBtn");
+      if (sumBtnAfterMsg.textContent === "Summarized") sumBtnAfterMsg.textContent = "Summarize";
+      ocSetState("chatting");
+      break;
+    case "ocStopped":
+      ocSetState("chatting");
+      document.getElementById("ocStopBtn").textContent = "Stop";
+      document.getElementById("ocSummarizeBtn").textContent = "Summarize";
+      document.getElementById("ocSummarizeBtn").disabled = false;
       document.getElementById("ocSendBtn").disabled = false;
       document.getElementById("ocSendBtn").textContent = "Send";
       break;
@@ -1474,10 +1518,14 @@ window.addEventListener("message", function(e) {
       document.getElementById("ocSendBtn").disabled = false;
       document.getElementById("ocSendBtn").textContent = "Send";
       if (ocState === "starting") ocSetState("initial");
+      else ocSetState("chatting");
       break;
-    case "ocSessionEnded":
-      ocReset();
+    case "ocSessionEnded": {
+      var endBtnEl = document.getElementById("ocEndBtn");
+      endBtnEl.textContent = "Ended";
+      endBtnEl.disabled = true;
       break;
+    }
   }
 });
 
@@ -1499,28 +1547,31 @@ function ocGetContentMd() {
     ? allLoadedMessages.filter(function(m) { return ids.indexOf(m.id) >= 0; })
     : allLoadedMessages;
   if (msgs.length === 0) return "";
-  var lines = ["# Session Content\\n"];
+  var lines = ["# Session Content", ""];
   msgs.forEach(function(m) {
-    lines.push("## " + (m.role || "unknown").toUpperCase() + " (" + (m.timeFormatted || "") + ")\\n");
+    lines.push("## " + (m.role || "unknown").toUpperCase() + " (" + (m.timeFormatted || "") + ")");
+    lines.push("");
     var parts = partsCache[m.id];
     if (parts && parts.length > 0) {
       parts.forEach(function(p) {
-        if (p.type === "text" && p.content) lines.push(p.content + "\\n");
-        else if (p.type === "reasoning" && p.content) lines.push("> " + p.content + "\\n");
-        else if (p.type === "tool-invocation" && p.toolName) lines.push("**Tool**: " + p.toolName + "\\n");
+        if (p.type === "text" && p.text) { lines.push(p.text); lines.push(""); }
+        else if (p.type === "reasoning" && p.text) { lines.push("> " + p.text); lines.push(""); }
+        else if (p.type === "tool" && p.toolName) { lines.push("**Tool**: " + p.toolName); lines.push(""); }
       });
     }
-    lines.push("---\\n");
+    lines.push("---");
+    lines.push("");
   });
   return lines.join("\\n");
 }
 
-function ocSetState(state) {
+ function ocSetState(state) {
   ocState = state;
   var runBtn = document.getElementById("ocRunBtn");
   var modelSel = document.getElementById("ocModelSelect");
   var qualitySel = document.getElementById("ocQualitySelect");
   var sumBtn = document.getElementById("ocSummarizeBtn");
+  var stopBtn = document.getElementById("ocStopBtn");
   var endBtn = document.getElementById("ocEndBtn");
   var inputBox = document.getElementById("ocInputBox");
   var sendBtn = document.getElementById("ocSendBtn");
@@ -1531,7 +1582,11 @@ function ocSetState(state) {
     runBtn.disabled = false;
     modelSel.disabled = true;
     qualitySel.disabled = true;
+    sumBtn.textContent = "Summarize";
     sumBtn.disabled = true;
+    stopBtn.textContent = "Stop";
+    stopBtn.disabled = true;
+    endBtn.textContent = "End";
     endBtn.disabled = true;
     inputBox.disabled = true;
     sendBtn.disabled = true;
@@ -1542,6 +1597,7 @@ function ocSetState(state) {
     modelSel.disabled = true;
     qualitySel.disabled = true;
     sumBtn.disabled = true;
+    stopBtn.disabled = true;
     endBtn.disabled = true;
     inputBox.disabled = true;
     sendBtn.disabled = true;
@@ -1552,6 +1608,7 @@ function ocSetState(state) {
     modelSel.disabled = false;
     qualitySel.disabled = false;
     sumBtn.disabled = false;
+    stopBtn.disabled = true;
     endBtn.disabled = true;
     inputBox.disabled = true;
     sendBtn.disabled = true;
@@ -1562,9 +1619,16 @@ function ocSetState(state) {
     modelSel.disabled = false;
     qualitySel.disabled = false;
     sumBtn.disabled = false;
+    stopBtn.disabled = true;
     endBtn.disabled = false;
     inputBox.disabled = false;
     sendBtn.disabled = false;
+  } else if (state === "streaming") {
+    sumBtn.disabled = true;
+    stopBtn.disabled = false;
+    endBtn.disabled = true;
+    inputBox.disabled = true;
+    sendBtn.disabled = true;
   }
 }
 
@@ -1573,6 +1637,13 @@ function ocStartServer() {
   ocSetState("starting");
   var contentMd = ocGetContentMd();
   vscode.postMessage({ type: "ocStartServer", sessionId: currentSessionId || "unknown", contentMd: contentMd });
+}
+
+function ocStop() {
+  var stopBtn = document.getElementById("ocStopBtn");
+  stopBtn.disabled = true;
+  stopBtn.textContent = "Stopping...";
+  vscode.postMessage({ type: "ocStop" });
 }
 
 function ocSummarize() {
@@ -1584,6 +1655,7 @@ function ocSummarize() {
   var sumBtn = document.getElementById("ocSummarizeBtn");
   sumBtn.disabled = true;
   sumBtn.textContent = "Summarizing...";
+  ocSetState("streaming");
   vscode.postMessage({ type: "ocSummarize", providerID: providerID, modelID: modelID });
 }
 
@@ -1601,6 +1673,10 @@ function ocSendMessage() {
   var sendBtn = document.getElementById("ocSendBtn");
   sendBtn.disabled = true;
   sendBtn.textContent = "...";
+  var sumBtn = document.getElementById("ocSummarizeBtn");
+  if (sumBtn.textContent === "Summarized") sumBtn.textContent = "Summarize";
+  _ocStreamNode.chat = null;
+  ocSetState("streaming");
   vscode.postMessage({ type: "ocSendMessage", text: text, providerID: providerID, modelID: modelID });
 }
 
@@ -1625,6 +1701,46 @@ function ocAppendChat(role, text) {
   area.scrollTop = area.scrollHeight;
 }
 
+var _ocStreamNode = { chat: null, summary: null };
+
+function ocStreamDelta(target, delta) {
+  if (!delta) return;
+  if (target === "chat") {
+    var area = document.getElementById("ocChatArea");
+    if (area.querySelector(".oc-placeholder")) area.innerHTML = "";
+    if (!_ocStreamNode.chat) {
+      var div = document.createElement("div");
+      div.className = "oc-chat-msg";
+      div.innerHTML = '<span class="oc-badge-ai">AI</span><div class="oc-msg-text oc-streaming"></div>';
+      area.appendChild(div);
+      _ocStreamNode.chat = div.querySelector(".oc-msg-text");
+    }
+    _ocStreamNode.chat.textContent += delta;
+    area.scrollTop = area.scrollHeight;
+  } else if (target === "summary") {
+    var sumArea = document.getElementById("ocSummaryArea");
+    if (!_ocStreamNode.summary) {
+      sumArea.innerHTML = '<div class="oc-summary-text oc-streaming"></div>';
+      _ocStreamNode.summary = sumArea.querySelector(".oc-summary-text");
+    }
+    _ocStreamNode.summary.textContent += delta;
+    sumArea.scrollTop = sumArea.scrollHeight;
+  }
+}
+
+function ocFlushStream(target, finalOutput) {
+  if (target === "chat") {
+    if (_ocStreamNode.chat) {
+      _ocStreamNode.chat.classList.remove("oc-streaming");
+      _ocStreamNode.chat = null;
+    } else {
+      ocAppendChat("assistant", finalOutput);
+    }
+  } else if (target === "summary") {
+    _ocStreamNode.summary = null;
+  }
+}
+
 function ocPopulateModels(models) {
   ocModels = models || [];
   var sel = document.getElementById("ocModelSelect");
@@ -1635,8 +1751,9 @@ function ocPopulateModels(models) {
     opt.textContent = m.label || (m.providerID + " / " + m.modelID);
     sel.appendChild(opt);
   });
-  // auto-select first
-  if (models.length > 0) sel.selectedIndex = 1;
+  var freeIdx = models.findIndex(function(m) { return m.modelID && m.modelID.endsWith("-free"); });
+  if (freeIdx >= 0) sel.selectedIndex = freeIdx + 1;
+  else if (models.length > 0) sel.selectedIndex = 1;
 }
 
 function ocPopulateQuality(models) {
@@ -1647,6 +1764,8 @@ function ocPopulateQuality(models) {
 
 function ocReset() {
   ocSetState("initial");
+  _ocStreamNode.chat = null;
+  _ocStreamNode.summary = null;
   document.getElementById("ocSummaryArea").innerHTML = '<span class="oc-placeholder">Summary will appear here after Summarize.</span>';
   document.getElementById("ocChatArea").innerHTML = '<span class="oc-placeholder">Chat messages will appear here.</span>';
   document.getElementById("ocInputBox").value = "";
@@ -2120,67 +2239,60 @@ init();
   .bottom-tab:hover { opacity: 0.85; }
   .bottom-tab.active { opacity: 1; color: #2979ff; border-bottom: 2px solid #2979ff; }
 
-  /* OPENCODE Tab Styles */
-  #tabOpencode { display: flex; flex-direction: column; height: 500px; }
-  .oc-summary-area {
-    flex: 1; overflow-y: auto; padding: 8px 10px;
-    border-bottom: 1px solid var(--vscode-panel-border);
-    font-size: 12px; line-height: 1.5;
+  /* OPENCODE Tab Fixed Layout */
+  #app.opencode-mode > .dir-section,
+  #app.opencode-mode > .panel-section { display: none !important; }
+  #app.opencode-mode > .bottom-controls {
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+    margin-top: 0 !important;
+    border-top: none !important;
+    min-height: 0;
   }
-  .oc-chat-area {
-    flex: 1.5; overflow-y: auto; padding: 8px 10px;
-    border-bottom: 1px solid var(--vscode-panel-border);
+  #app.opencode-mode > .bottom-controls > #tabOpencode {
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+    min-height: 0;
+    padding: 0;
+    background: #1e1e1e;
   }
-  .oc-input-row {
-    flex: 0.5; display: flex; gap: 0; padding: 6px 10px; min-height: 60px;
-  }
-  .oc-input-box {
-    flex: 1; resize: none; padding: 8px; font-size: 12px;
-    background: #2f2f2f; color: var(--vscode-foreground);
-    border: 2px solid #2979ff; border-radius: 8px 0 0 8px;
-    outline: none; font-family: inherit;
-  }
-  .oc-input-box:disabled { border-color: #555; opacity: 0.5; }
-  .oc-send-btn {
-    width: 50px; background: #2979ff; color: #fff; border: none;
-    border-radius: 0 8px 8px 0; cursor: pointer; font-size: 12px; font-weight: 600;
-  }
+  .oc-session-header { flex-shrink: 0; padding: 6px 12px; background: #252526; border-bottom: 1px solid #333; font-size: 11px; color: #888; font-family: monospace; }
+  .oc-main-area { flex: 1; display: flex; flex-direction: column; overflow: hidden; min-height: 0; }
+  .oc-summary-section { flex: 3; border-bottom: 1px solid #333; display: flex; flex-direction: column; min-height: 0; overflow: hidden; }
+  .oc-summary-title { flex-shrink: 0; padding: 4px 12px; background: #252526; font-size: 11px; font-weight: 600; color: #aaa; text-transform: uppercase; }
+  .oc-summary-content { flex: 1; overflow-y: auto; padding: 8px 12px; font-size: 12px; line-height: 1.5; }
+  .oc-chat-section { flex: 5; display: flex; flex-direction: column; min-height: 0; border-bottom: 1px solid #333; }
+  .oc-chat-content { flex: 1; overflow-y: auto; padding: 8px 12px; }
+  .oc-input-row { flex: 2; display: flex; gap: 0; padding: 8px 12px; background: #1e1e1e; min-height: 0; }
+  .oc-input-box { flex: 1; resize: none; padding: 10px 12px; font-size: 13px; background: #2d2d2d; color: #ccc; border: 2px solid #3d3d3d; border-radius: 6px 0 0 6px; outline: none; font-family: inherit; }
+  .oc-input-box:focus { border-color: #2979ff; }
+  .oc-input-box:disabled { opacity: 0.5; }
+  .oc-send-btn { width: 60px; background: #2979ff; color: #fff; border: none; border-radius: 0 6px 6px 0; cursor: pointer; font-size: 13px; font-weight: 600; }
   .oc-send-btn:disabled { opacity: 0.4; cursor: default; }
-  .oc-controls-row {
-    display: flex; gap: 8px; padding: 6px 10px; align-items: center;
-  }
-  .oc-btn {
-    padding: 5px 14px; border: none; border-radius: 14px;
-    font-size: 12px; font-weight: 600; cursor: pointer; color: #fff;
-  }
+  .oc-model-row { flex-shrink: 0; display: flex; gap: 8px; padding: 6px 12px; background: #252526; border-top: 1px solid #333; }
+  .oc-controls-row { flex-shrink: 0; display: flex; gap: 8px; padding: 8px 12px; align-items: center; background: #252526; border-top: 1px solid #333; }
+  .oc-btn { flex: 1; padding: 6px 14px; border: none; border-radius: 4px; font-size: 12px; font-weight: 500; cursor: pointer; color: #fff; }
   .oc-btn:disabled { opacity: 0.4; cursor: default; }
-  .oc-btn-run { background: #404040; }
-  .oc-btn-run.oc-btn-running { background: #2ea44a; }
+  .oc-btn-run { background: #3c3c3c; }
+  .oc-btn-run.oc-btn-running { background: #2ea44f; }
   .oc-btn-summarize { background: #2979ff; }
-  .oc-btn-end { background: #404040; }
-  .oc-select {
-    padding: 4px 8px; font-size: 11px; background: #2f2f2f;
-    color: var(--vscode-foreground); border: 1px solid #555;
-    border-radius: 6px; outline: none;
-  }
+  .oc-btn-stop { background: #d32f2f; }
+  .oc-btn-end { background: #444; }
+  .oc-select { flex: 1; padding: 6px 10px; font-size: 12px; background: #3c3c3c; color: #ccc; border: 1px solid #555; border-radius: 4px; outline: none; }
   .oc-select:disabled { opacity: 0.4; }
-  .oc-chat-msg {
-    display: flex; gap: 8px; padding: 6px 0; align-items: flex-start;
-  }
-  .oc-badge-you {
-    background: #d4882a; color: #fff; font-size: 10px; font-weight: 700;
-    padding: 2px 8px; border-radius: 10px; white-space: nowrap;
-  }
-  .oc-badge-ai {
-    background: #2979ff; color: #fff; font-size: 10px; font-weight: 700;
-    padding: 2px 8px; border-radius: 10px; white-space: nowrap;
-  }
-  .oc-msg-text {
-    font-size: 12px; line-height: 1.5; white-space: pre-wrap; word-break: break-word;
-    background: #262626; border: 1px solid #333; border-radius: 8px; padding: 8px 10px; flex: 1;
-  }
+  .oc-chat-msg { display: flex; gap: 8px; padding: 8px 0; align-items: flex-start; }
+  .oc-badge-you { background: #d4882a; color: #fff; font-size: 10px; font-weight: 700; padding: 2px 8px; border-radius: 4px; white-space: nowrap; }
+  .oc-badge-ai { background: #2979ff; color: #fff; font-size: 10px; font-weight: 700; padding: 2px 8px; border-radius: 4px; white-space: nowrap; }
+  .oc-msg-text { font-size: 13px; line-height: 1.5; white-space: pre-wrap; word-break: break-word; background: #2d2d2d; border: 1px solid #3d3d3d; border-radius: 6px; padding: 10px 12px; flex: 1; }
   .oc-placeholder { color: #666; font-size: 12px; font-style: italic; padding: 12px; }
   .oc-summary-text { white-space: pre-wrap; word-break: break-word; }
+  .oc-streaming::after { content: "▋"; animation: oc-blink 0.8s step-end infinite; color: #2979ff; }
+  @keyframes oc-blink { 0%, 100% { opacity: 1; } 50% { opacity: 0; } }
+
 </style>
 </head>
 <body>
