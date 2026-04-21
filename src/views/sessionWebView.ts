@@ -258,9 +258,10 @@ export class SessionPanelProvider implements vscode.WebviewViewProvider {
       const sessionId = this.ocSessionId;
       const chatLog = this.ocChatLog;
 
-      const promptText = chatLog.length === 0
-        ? "请用中文总结以下会话内容：\n\n" + fs.readFileSync(this.ocMdPath, "utf-8")
-        : "请用中文总结当前会话内容。";
+    const mdContent = fs.readFileSync(this.ocMdPath, "utf-8");
+    const promptText = chatLog.length === 0
+      ? "请用中文总结以下会话内容：\n\n" + mdContent
+      : "请用中文总结以下会话内容（包括之前的总结和新的对话）：\n\n" + mdContent;
 
       chatLog.push({ role: "user", text: promptText });
       this.ocStreamAbortFlag = { abort: false };
@@ -1482,16 +1483,14 @@ window.addEventListener("message", function(e) {
     case "ocSummarizeDelta":
       ocStreamDelta("summary", msg.delta);
       break;
-    case "ocSummarizeResult": {
-      var sumArea = document.getElementById("ocSummaryArea");
-      ocFlushStream("summary", msg.output);
-      sumArea.innerHTML = '<div class="oc-summary-text">' + esc(msg.output) + '</div>';
-      var sumBtnEl = document.getElementById("ocSummarizeBtn");
-      sumBtnEl.textContent = "Summarized";
-      sumBtnEl.disabled = false;
-      ocSetState("chatting");
-      break;
-    }
+      case "ocSummarizeResult": {
+          ocFlushStream("summary", msg.output);
+          var sumBtnEl = document.getElementById("ocSummarizeBtn");
+          sumBtnEl.textContent = "Summarize";
+          sumBtnEl.disabled = false;
+          ocSetState("chatting");
+          break;
+        }
     case "ocMessageDelta":
       ocStreamDelta("chat", msg.delta);
       break;
