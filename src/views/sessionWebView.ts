@@ -10,9 +10,11 @@ const OC_SUMMARY_DIR = "/workspace/oc_session_summary_continue";
 export class SessionPanelProvider implements vscode.WebviewViewProvider {
   private view: vscode.WebviewView | null = null;
   private ocClient: OpenCodeClient | null = null;
-  private ocSessionId = "";
+  private ocSummarizeSessionId = "";
+  private ocChatSessionId = "";
   private ocMdPath = "";
   private ocChatLog: Array<{ role: string; text: string }> = [];
+  private ocSummarizeLog: Array<{ role: string; text: string }> = [];
   private ocStreamAbortFlag = { abort: false };
 
   constructor(
@@ -23,7 +25,22 @@ export class SessionPanelProvider implements vscode.WebviewViewProvider {
   resolveWebviewView(webviewView: vscode.WebviewView): void {
     this.view = webviewView;
     webviewView.webview.options = { enableScripts: true };
-    webviewView.webview.onDidReceiveMessage((msg) => this.handleMessage(msg));
+    webviewView.webview.onDidReceiveMessage((msg) => {
+      if ((msg as Record<string, unknown>).type === "ocStop") {
+        this.ocStreamAbortFlag.abort = true;
+        if (this.ocClient) {
+          if (this.ocSummarizeSessionId) {
+            this.ocClient.abortSession(this.ocSummarizeSessionId).catch(() => {});
+          }
+          if (this.ocChatSessionId) {
+            this.ocClient.abortSession(this.ocChatSessionId).catch(() => {});
+          }
+        }
+        this.postMessage({ type: "ocStopped" });
+        return;
+      }
+      this.handleMessage(msg);
+    });
     this.renderMain();
   }
 
@@ -195,15 +212,7 @@ export class SessionPanelProvider implements vscode.WebviewViewProvider {
       }
       case "ocEndSession": {
         await this.handleOcEndSession();
-        break;
-      }
-      case "ocStop": {
-        this.ocStreamAbortFlag.abort = true;
-        if (this.ocClient && this.ocSessionId) {
-          try { await this.ocClient.abortSession(this.ocSessionId); } catch { /* ignore */ }
-        }
-        this.postMessage({ type: "ocStopped" });
-        break;
+      break;
       }
     }
   }
@@ -219,6 +228,7 @@ export class SessionPanelProvider implements vscode.WebviewViewProvider {
       fs.writeFileSync(mdPath, contentMd, "utf-8");
       this.ocMdPath = mdPath;
       this.ocChatLog = [];
+      this.ocSummarizeLog = [];
 
       const baseUrl = "http://127.0.0.1:4096";
       const serveCommand = "/root/.opencode/bin/opencode serve";
@@ -232,6 +242,8 @@ export class SessionPanelProvider implements vscode.WebviewViewProvider {
       if (!await this.ocClient.isHealthy()) {
         await this.ocClient.startServer();
       }
+
+		this.ocChatSessionId = await this.ocClient.createSession("OC Sessions Chat", true);
 
       const mdFileName = path.basename(mdPath);
       this.postMessage({ type: "ocServerStarted", mdPath: mdFileName });
@@ -251,100 +263,121 @@ export class SessionPanelProvider implements vscode.WebviewViewProvider {
       const modelID = (msg.modelID as string) || "";
       const model = providerID && modelID ? { providerID, modelID } : undefined;
 
-      if (!this.ocSessionId) {
-        this.ocSessionId = await this.ocClient.createSession("OC Sessions Summary");
-      }
+		if (!this.ocSummarizeSessionId) {
+			this.ocSummarizeSessionId = await this.ocClient.createSession("OC Sessions Summary", true);
+		}
 
-      const sessionId = this.ocSessionId;
-      const chatLog = this.ocChatLog;
+		const sessionId = this.ocSummarizeSessionId;
+		const summarizeLog = this.ocSummarizeLog;
 
-    const mdContent = fs.readFileSync(this.ocMdPath, "utf-8");
-    const promptText = chatLog.length === 0
-      ? "请用中文总结以下会话内容：\n\n" + mdContent
-      : "请用中文总结以下会话内容（包括之前的总结和新的对话）：\n\n" + mdContent;
+		const mdContent = fs.readFileSync(this.ocMdPath, "utf-8");
+		let promptText: string;
+		if (summarizeLog.length === 0) {
+			promptText = "请用中文总结以下会话内容：\n\n" + mdContent;
+		} else {
+			const chatHistory = this.ocChatLog
+				.map((entry) => `[${entry.role.toUpperCase()}]: ${entry.text}`)
+				.join("\n\n");
+			promptText = "请用中文总结以下会话内容（包括原始内容和新的对话）：\n\n"
+				+ "## 原始会话内容\n\n" + mdContent
+				+ "\n\n## 新的对话\n\n" + chatHistory;
+		}
 
-      chatLog.push({ role: "user", text: promptText });
-      this.ocStreamAbortFlag = { abort: false };
-      await this.ocClient.promptStream(
-        { sessionId, prompt: promptText, model, tools: {} },
-        this.ocStreamAbortFlag,
-        (delta) => this.postMessage({ type: "ocSummarizeDelta", delta }),
-        (output) => {
-          chatLog.push({ role: "assistant", text: output });
-          this.postMessage({ type: "ocSummarizeResult", output });
-        },
-        (err) => this.postMessage({ type: "ocError", error: err.message })
-      );
+		this.postMessage({ type: "ocSummarizing" });
+
+		const result = await this.ocClient.prompt({
+			sessionId,
+			prompt: promptText,
+			model,
+		});
+
+		summarizeLog.push({ role: "user", text: promptText });
+		summarizeLog.push({ role: "assistant", text: result.output });
+		this.postMessage({ type: "ocSummarizeResult", output: result.output });
     } catch (e: unknown) {
       const errMsg = e instanceof Error ? e.message : String(e);
       this.postMessage({ type: "ocError", error: errMsg });
     }
   }
 
-  private async handleOcSendMessage(msg: { [key: string]: unknown }): Promise<void> {
-    try {
-      if (!this.ocClient || !this.ocSessionId) throw new Error("No active OpenCode session.");
-      const text = (msg.text as string) || "";
-      const providerID = (msg.providerID as string) || "";
-      const modelID = (msg.modelID as string) || "";
-      const model = providerID && modelID ? { providerID, modelID } : undefined;
+	private ocChatPromptInProgress = false;
 
-      const sessionId = this.ocSessionId;
-      const chatLog = this.ocChatLog;
-      chatLog.push({ role: "user", text });
+	private async handleOcSendMessage(msg: { [key: string]: unknown }): Promise<void> {
+		try {
+			if (!this.ocClient || !this.ocChatSessionId) throw new Error("No active OpenCode session.");
+			const text = (msg.text as string) || "";
+			const providerID = (msg.providerID as string) || "";
+			const modelID = (msg.modelID as string) || "";
+			const model = providerID && modelID ? { providerID, modelID } : undefined;
 
-      this.ocStreamAbortFlag = { abort: false };
-      await this.ocClient.promptStream(
-        { sessionId, prompt: text, model },
-        this.ocStreamAbortFlag,
-        (delta) => this.postMessage({ type: "ocMessageDelta", delta }),
-        (output) => {
-          chatLog.push({ role: "assistant", text: output });
-          this.postMessage({ type: "ocMessageResult", output, userText: text });
-        },
-        (err) => this.postMessage({ type: "ocError", error: err.message })
-      );
-    } catch (e: unknown) {
-      const errMsg = e instanceof Error ? e.message : String(e);
-      this.postMessage({ type: "ocError", error: errMsg });
-    }
-  }
+			const sessionId = this.ocChatSessionId;
+			const chatLog = this.ocChatLog;
+
+			this.ocChatPromptInProgress = true;
+			this.postMessage({ type: "ocMessagePending" });
+
+			const PROMPT_TIMEOUT_MS = 60000;
+			const result = await Promise.race([
+				this.ocClient.prompt({ sessionId, prompt: text, model }),
+				new Promise<never>((_, reject) =>
+					setTimeout(() => reject(new Error("AI response timed out (60s)")), PROMPT_TIMEOUT_MS)
+				),
+			]);
+
+			this.ocChatPromptInProgress = false;
+			const output = result.output || "(no response)";
+			chatLog.push({ role: "user", text });
+			chatLog.push({ role: "assistant", text: output });
+			this.postMessage({ type: "ocMessageResult", output, userText: text });
+		} catch (e: unknown) {
+			this.ocChatPromptInProgress = false;
+			const errMsg = e instanceof Error ? e.message : String(e);
+			if (errMsg.includes("abort") || errMsg.includes("cancel") || errMsg.includes("stop")) {
+				return;
+			} else {
+				this.postMessage({ type: "ocError", error: errMsg });
+			}
+		}
+	}
 
   private async handleOcEndSession(): Promise<void> {
     try {
-      if (this.ocClient && this.ocSessionId && this.ocMdPath && this.ocChatLog.length > 0) {
+      if (this.ocClient && this.ocMdPath && this.ocSummarizeLog.length > 0) {
         const appendLines: string[] = ["\n\n---\n\n## OpenCode Summary Session\n"];
+        for (const entry of this.ocSummarizeLog) {
+          appendLines.push(`### [${entry.role.toUpperCase()}]\n\n${entry.text}\n`);
+        }
+        const saveContent = appendLines.join("\n");
+        fs.appendFileSync(this.ocMdPath, saveContent, "utf-8");
+      }
+    } catch { /* ignore */ }
+    try {
+      if (this.ocClient && this.ocMdPath && this.ocChatLog.length > 0) {
+        const appendLines: string[] = ["\n\n---\n\n## OpenCode Chat Session\n"];
         for (const entry of this.ocChatLog) {
           appendLines.push(`### [${entry.role.toUpperCase()}]\n\n${entry.text}\n`);
         }
         const saveContent = appendLines.join("\n");
-        await this.ocClient.prompt({
-          sessionId: this.ocSessionId,
-          prompt: `Please write the following content to the end of the file ${this.ocMdPath}:\n\n${saveContent}`,
-          agent: "build",
-        });
+        fs.appendFileSync(this.ocMdPath, saveContent, "utf-8");
       }
-    } catch {
-      // fallback: direct write if build agent fails
-      try {
-        if (this.ocMdPath && this.ocChatLog.length > 0) {
-          const appendLines: string[] = ["\n\n---\n\n## OpenCode Summary Session\n"];
-          for (const entry of this.ocChatLog) {
-            appendLines.push(`### [${entry.role.toUpperCase()}]\n\n${entry.text}\n`);
-          }
-          fs.appendFileSync(this.ocMdPath, appendLines.join("\n"), "utf-8");
-        }
-      } catch { /* ignore */ }
-    } finally {
-      if (this.ocSessionId && this.ocClient) {
-        try { await this.ocClient.abortSession(this.ocSessionId); } catch { /* ignore */ }
+    } catch { /* ignore */ }
+    try {
+      if (this.ocSummarizeSessionId && this.ocClient) {
+        await this.ocClient.abortSession(this.ocSummarizeSessionId);
       }
-      this.ocSessionId = "";
-      this.ocClient = null;
-      this.ocMdPath = "";
-      this.ocChatLog = [];
-      this.postMessage({ type: "ocSessionEnded" });
-    }
+    } catch { /* ignore */ }
+    try {
+      if (this.ocChatSessionId && this.ocClient) {
+        await this.ocClient.abortSession(this.ocChatSessionId);
+      }
+    } catch { /* ignore */ }
+    this.ocSummarizeSessionId = "";
+    this.ocChatSessionId = "";
+    this.ocClient = null;
+    this.ocMdPath = "";
+    this.ocChatLog = [];
+    this.ocSummarizeLog = [];
+    this.postMessage({ type: "ocSessionEnded" });
   }
 
   private postMessage(msg: Record<string, unknown>): void {
@@ -1473,52 +1506,77 @@ window.addEventListener("message", function(e) {
       renderMessages();
       refreshContentViewer();
       break;
-    case "ocServerStarted":
-      ocSetState("running");
-      break;
+      case "ocServerStarted":
+          ocSetState("chatting");
+          break;
     case "ocModels":
       ocPopulateModels(msg.models);
       ocPopulateQuality(msg.models);
       break;
-    case "ocSummarizeDelta":
-      ocStreamDelta("summary", msg.delta);
-      break;
-      case "ocSummarizeResult": {
-          ocFlushStream("summary", msg.output);
+      case "ocSummarizing":
+          document.getElementById("ocSummarizeBtn").textContent = "Summarizing...";
+          ocSetState("streaming");
+          break;
+        case "ocSummarizeResult": {
+          var sumArea = document.getElementById("ocSummaryArea");
+          sumArea.innerHTML = '<div class="oc-summary-text">' + esc(msg.output) + '</div>';
           var sumBtnEl = document.getElementById("ocSummarizeBtn");
           sumBtnEl.textContent = "Summarize";
           sumBtnEl.disabled = false;
           ocSetState("chatting");
           break;
         }
-    case "ocMessageDelta":
-      ocStreamDelta("chat", msg.delta);
-      break;
-    case "ocMessageResult":
-      ocFlushStream("chat", msg.output);
-      document.getElementById("ocSendBtn").disabled = false;
-      document.getElementById("ocSendBtn").textContent = "Send";
-      var sumBtnAfterMsg = document.getElementById("ocSummarizeBtn");
-      if (sumBtnAfterMsg.textContent === "Summarized") sumBtnAfterMsg.textContent = "Summarize";
-      ocSetState("chatting");
-      break;
-    case "ocStopped":
-      ocSetState("chatting");
-      document.getElementById("ocStopBtn").textContent = "Stop";
-      document.getElementById("ocSummarizeBtn").textContent = "Summarize";
-      document.getElementById("ocSummarizeBtn").disabled = false;
-      document.getElementById("ocSendBtn").disabled = false;
-      document.getElementById("ocSendBtn").textContent = "Send";
-      break;
-    case "ocError":
-      ocAppendChat("assistant", "[Error] " + msg.error);
-      document.getElementById("ocSummarizeBtn").textContent = "Summarize";
-      document.getElementById("ocSummarizeBtn").disabled = false;
-      document.getElementById("ocSendBtn").disabled = false;
-      document.getElementById("ocSendBtn").textContent = "Send";
-      if (ocState === "starting") ocSetState("initial");
-      else ocSetState("chatting");
-      break;
+		case "ocMessagePending":
+				ocAppendChat("assistant", "Thinking...");
+				break;
+			case "ocMessageResult":
+				var chatArea = document.getElementById("ocChatArea");
+				var thinkingDivs = chatArea.querySelectorAll(".oc-chat-msg:last-child .oc-msg-text");
+				if (thinkingDivs.length > 0) {
+					var lastDiv = thinkingDivs[thinkingDivs.length - 1];
+					if (lastDiv.textContent === "Thinking...") {
+						lastDiv.textContent = msg.output || "(no response)";
+					} else {
+						ocAppendChat("assistant", msg.output || "(no response)");
+					}
+				} else {
+					ocAppendChat("assistant", msg.output || "(no response)");
+				}
+				document.getElementById("ocSendBtn").disabled = false;
+				document.getElementById("ocSendBtn").textContent = "Send";
+				var sumBtnAfterMsg = document.getElementById("ocSummarizeBtn");
+				sumBtnAfterMsg.textContent = "Summarize";
+				sumBtnAfterMsg.disabled = false;
+				ocSetState("chatting");
+				break;
+		case "ocStopped":
+				var chatAreaStopped = document.getElementById("ocChatArea");
+				var stoppedThinking = chatAreaStopped.querySelectorAll(".oc-chat-msg:last-child .oc-msg-text");
+				if (stoppedThinking.length > 0 && stoppedThinking[stoppedThinking.length - 1].textContent === "Thinking...") {
+					stoppedThinking[stoppedThinking.length - 1].textContent = "(stopped)";
+				}
+				ocSetState("chatting");
+				document.getElementById("ocStopBtn").textContent = "Stop";
+				document.getElementById("ocSummarizeBtn").textContent = "Summarize";
+				document.getElementById("ocSummarizeBtn").disabled = false;
+				document.getElementById("ocSendBtn").disabled = false;
+				document.getElementById("ocSendBtn").textContent = "Send";
+				break;
+		case "ocError":
+				var chatAreaErr = document.getElementById("ocChatArea");
+				var errThinking = chatAreaErr.querySelectorAll(".oc-chat-msg:last-child .oc-msg-text");
+				if (errThinking.length > 0 && errThinking[errThinking.length - 1].textContent === "Thinking...") {
+					errThinking[errThinking.length - 1].textContent = "[Error] " + msg.error;
+				} else {
+					ocAppendChat("assistant", "[Error] " + msg.error);
+				}
+				document.getElementById("ocSummarizeBtn").textContent = "Summarize";
+				document.getElementById("ocSummarizeBtn").disabled = false;
+				document.getElementById("ocSendBtn").disabled = false;
+				document.getElementById("ocSendBtn").textContent = "Send";
+				if (ocState === "starting") ocSetState("initial");
+				else ocSetState("chatting");
+				break;
     case "ocSessionEnded": {
       var endBtnEl = document.getElementById("ocEndBtn");
       endBtnEl.textContent = "Ended";
@@ -1645,7 +1703,7 @@ function ocStop() {
   vscode.postMessage({ type: "ocStop" });
 }
 
-function ocSummarize() {
+  function ocSummarize() {
   if (ocState !== "running" && ocState !== "chatting") return;
   var sel = document.getElementById("ocModelSelect");
   var val = sel.value;
@@ -1653,31 +1711,28 @@ function ocSummarize() {
   if (val) { var p = val.split("::"); providerID = p[0] || ""; modelID = p[1] || ""; }
   var sumBtn = document.getElementById("ocSummarizeBtn");
   sumBtn.disabled = true;
-  sumBtn.textContent = "Summarizing...";
-  ocSetState("streaming");
   vscode.postMessage({ type: "ocSummarize", providerID: providerID, modelID: modelID });
 }
 
-function ocSendMessage() {
-  if (ocState !== "chatting") return;
-  var inputBox = document.getElementById("ocInputBox");
-  var text = inputBox.value.trim();
-  if (!text) return;
-  inputBox.value = "";
-  var sel = document.getElementById("ocModelSelect");
-  var val = sel.value;
-  var providerID = "", modelID = "";
-  if (val) { var p = val.split("::"); providerID = p[0] || ""; modelID = p[1] || ""; }
-  ocAppendChat("user", text);
-  var sendBtn = document.getElementById("ocSendBtn");
-  sendBtn.disabled = true;
-  sendBtn.textContent = "...";
-  var sumBtn = document.getElementById("ocSummarizeBtn");
-  if (sumBtn.textContent === "Summarized") sumBtn.textContent = "Summarize";
-  _ocStreamNode.chat = null;
-  ocSetState("streaming");
-  vscode.postMessage({ type: "ocSendMessage", text: text, providerID: providerID, modelID: modelID });
-}
+	function ocSendMessage() {
+		if (ocState !== "chatting") return;
+		var inputBox = document.getElementById("ocInputBox");
+		var text = inputBox.value.trim();
+		if (!text) return;
+		inputBox.value = "";
+		var sel = document.getElementById("ocModelSelect");
+		var val = sel.value;
+		var providerID = "", modelID = "";
+		if (val) { var p = val.split("::"); providerID = p[0] || ""; modelID = p[1] || ""; }
+		ocAppendChat("user", text);
+		var sendBtn = document.getElementById("ocSendBtn");
+		sendBtn.disabled = true;
+		sendBtn.textContent = "Sending...";
+		var sumBtn = document.getElementById("ocSummarizeBtn");
+		sumBtn.disabled = true;
+		ocSetState("streaming");
+		vscode.postMessage({ type: "ocSendMessage", text: text, providerID: providerID, modelID: modelID });
+	}
 
 function ocEndSession() {
   if (ocState !== "chatting") return;

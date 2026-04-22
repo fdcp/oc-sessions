@@ -214,16 +214,31 @@ function dedupeOptions(options: string[]): string[] {
 }
 
 function extractOutputFromParts(parts: unknown[]): string {
-  const texts: string[] = [];
-  for (const part of parts) {
-    if (!isRecord(part)) continue;
-    const type = toTrimmedString(part.type);
-    if (type === "text") {
-      const text = toTrimmedString(part.text);
-      if (text) texts.push(text);
-    }
-  }
-  return texts.join("\n\n");
+	const texts: string[] = [];
+	for (const part of parts) {
+		if (!isRecord(part)) continue;
+		const type = toTrimmedString(part.type);
+		if (type === "text") {
+			const text = toTrimmedString(part.text);
+			if (text) texts.push(text);
+		} else if (type === "reasoning") {
+			const text = toTrimmedString(part.text);
+			if (text) texts.push(text);
+		} else if (type === "tool") {
+			const rawState = part.state;
+			if (isRecord(rawState)) {
+				const status = toTrimmedString(rawState["status"]);
+				if (status === "completed") {
+					const output = toTrimmedString(rawState["output"]);
+					if (output) texts.push(output);
+				} else if (status === "error") {
+					const error = toTrimmedString(rawState["error"]);
+					if (error) texts.push("[Tool Error] " + error);
+				}
+			}
+		}
+	}
+	return texts.join("\n\n");
 }
 
 // ---------------------------------------------------------------------------
@@ -269,25 +284,35 @@ export class OpenCodeClient {
     }
   }
 
-  async createSession(title: string): Promise<string> {
-    const client = await this.getClient();
-    const raw = await client.session.create({
-      title,
-      directory: this.settings.directory,
-      permission: [
-        { permission: "edit", pattern: "*", action: "allow" },
-        { permission: "bash", pattern: "*", action: "allow" },
-        { permission: "external_directory", pattern: "*", action: "allow" },
-        { permission: "webfetch", pattern: "*", action: "allow" },
-        { permission: "doom_loop", pattern: "*", action: "allow" },
-        { permission: "question", pattern: "*", action: "allow" },
-      ],
-    });
-    const session = unwrapData(raw);
-    const id = String(session?.id ?? "").trim();
-    if (!id) throw new Error("OpenCode returned an invalid session ID.");
-    return id;
-  }
+	async createSession(title: string, denyTools: boolean = false): Promise<string> {
+		const client = await this.getClient();
+		const permission = denyTools
+			? [
+					{ permission: "edit", pattern: "*", action: "deny" },
+					{ permission: "bash", pattern: "*", action: "deny" },
+					{ permission: "external_directory", pattern: "*", action: "deny" },
+					{ permission: "webfetch", pattern: "*", action: "deny" },
+					{ permission: "doom_loop", pattern: "*", action: "deny" },
+					{ permission: "question", pattern: "*", action: "deny" },
+				]
+			: [
+					{ permission: "edit", pattern: "*", action: "allow" },
+					{ permission: "bash", pattern: "*", action: "allow" },
+					{ permission: "external_directory", pattern: "*", action: "allow" },
+					{ permission: "webfetch", pattern: "*", action: "allow" },
+					{ permission: "doom_loop", pattern: "*", action: "allow" },
+					{ permission: "question", pattern: "*", action: "allow" },
+				];
+		const raw = await client.session.create({
+			title,
+			directory: this.settings.directory,
+			permission,
+		});
+		const session = unwrapData(raw);
+		const id = String(session?.id ?? "").trim();
+		if (!id) throw new Error("OpenCode returned an invalid session ID.");
+		return id;
+	}
 
   async prompt(request: PromptRequest): Promise<PromptResult> {
     const client = await this.getClient();
@@ -345,8 +370,9 @@ export class OpenCodeClient {
     let done = false;
     let lastDeltaTime = Date.now();
     const NO_DELTA_TIMEOUT_MS = 60000;
-    const promptSentAt = Date.now();
-    const IDLE_GRACE_MS = 1500;
+    const MAX_ACCUMULATED_LEN = 20000;
+    let sawBusy = false;
+    let totalLen = 0;
 
     const monitor = setInterval(async () => {
       if (done) return;
@@ -378,26 +404,39 @@ export class OpenCodeClient {
           if (field !== "text") continue;
           const delta = toTrimmedString(props.delta);
           if (delta) {
+            sawBusy = true;
             lastDeltaTime = Date.now();
             accumulated.push(delta);
+            totalLen += delta.length;
             onDelta(delta);
+            if (totalLen >= MAX_ACCUMULATED_LEN) {
+              done = true;
+              onDone(accumulated.join(""));
+              break;
+            }
           }
         } else if (type === "session.idle" && props) {
           const sid = toTrimmedString(props.sessionID);
           if (sid !== request.sessionId) continue;
-          if (Date.now() - promptSentAt < IDLE_GRACE_MS) continue;
+          if (!sawBusy) continue;
           done = true;
           onDone(accumulated.join(""));
           break;
         } else if (type === "session.status" && props) {
           const sid = toTrimmedString(props.sessionID);
           if (sid !== request.sessionId) continue;
-          if (Date.now() - promptSentAt < IDLE_GRACE_MS) continue;
           const status = isRecord(props.status) ? props.status : null;
-          if (status && toTrimmedString(status.type) === "idle") {
-            done = true;
-            onDone(accumulated.join(""));
-            break;
+          if (status) {
+            const statusType = toTrimmedString(status.type);
+            if (statusType === "busy") {
+              sawBusy = true;
+              lastDeltaTime = Date.now();
+            } else if (statusType === "idle") {
+              if (!sawBusy) continue;
+              done = true;
+              onDone(accumulated.join(""));
+              break;
+            }
           }
         }
       }
