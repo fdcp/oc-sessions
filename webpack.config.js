@@ -13,6 +13,7 @@ const config = {
   },
   externals: {
     vscode: "commonjs vscode",
+    "@opencode-ai/sdk/v2/client": "commonjs @opencode-ai/sdk/v2/client",
   },
   resolve: {
     extensions: [".ts", ".js"],

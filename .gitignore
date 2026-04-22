@@ -1,4 +1,6 @@
 node_modules/
+lib/node_modules/
+!lib/node_modules/@opencode-ai/
 *.vsix
 out/
 dist/extension.js.map
